@@ -1,0 +1,12 @@
+# Real deployment config — contains server-specific names and paths.
+# Copy config.example.sql to config.sql and edit it. Never commit config.sql.
+config.sql
+
+# Captured output. xe_workload.statement_text holds real parameter values from
+# the monitored server and must never be committed.
+*.xel
+*.csv
+*.tsv
+out/
+export/
+history/
