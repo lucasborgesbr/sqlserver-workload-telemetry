@@ -13,6 +13,22 @@ It answers four questions about a live instance:
 
 Built for a migration baseline, but it works as general-purpose observability on a legacy instance.
 
+> **Before you run this: it captures real parameter values.**
+> `xe_workload.statement_text` will contain actual data from your production queries — customer names, identifiers, whatever your application passes as parameters. That is deliberate, because replayable test cases need real values, but it means the table is production data and possibly personal data. Read [Data sensitivity](#data-sensitivity) before deploying, and set `collect_statement = 0` if that trade is not acceptable in your environment.
+
+## Scope and caveats
+
+Honest about where this comes from: it was built and measured against **one** SQL Server 2014 SP3 Enterprise instance under a moderate OLTP workload. It works, and the design decisions are all backed by measurements — but those measurements are from that one instance.
+
+Treat as starting points, not universal truths:
+
+- **Collection intervals.** The 2-minute job-run interval exists because `sysjobhistory` on that instance kept about 11 minutes of history for its most frequent job. Yours may keep hours, or minutes.
+- **Retention defaults and the sizing figures.** Event rate varies by orders of magnitude between instances. Derive your own with queries 1 and 10 after a week.
+- **Guard step detection.** Off by default; it needs the pattern your own jobs use.
+- **The `who_is_active` noise filter.** The `background`/`dormant`/DatabaseMail exclusions held on that instance. Check what your own samples actually contain before trusting the filter.
+
+What generalises without qualification is the list of failure modes in [`docs/design-notes.md`](docs/design-notes.md). Those are properties of SQL Server, not of any one instance, and most of them fail silently.
+
 ## What it collects
 
 | Stream | Table | Content | Interval | Default retention |
@@ -25,6 +41,55 @@ Built for a migration baseline, but it works as general-purpose observability on
 Plus `collection_run`, an audit trail of every collector execution. That one matters more than it looks: without it, a gap in the data is indistinguishable from a collector that quietly died.
 
 **Which table to use for what:** `query_stat_delta` tells you *what matters and what it costs*; `xe_workload` holds *the full text with the actual values*. `query_text` is a labelling dimension, truncated at 4,000 characters — it is not a source of complete queries.
+
+## What gets created
+
+The full footprint on the instance, so you know what you are agreeing to before running `deploy.sql`:
+
+- **One database** (`dba_telemetry` by default), `RECOVERY SIMPLE`, holding 9 tables and 1 view. Nothing is created in `master`, `msdb` or your application databases.
+- **One server-scoped event session**, `Workload_Capture`, created stopped.
+- **7 stored procedures**, all in the telemetry database:
+
+| Procedure | What it does |
+|---|---|
+| `usp_collect_query_stats` | Snapshots `sys.dm_exec_query_stats` and computes the delta against the previous snapshot, flagging counter resets so plan cache eviction never yields a negative |
+| `usp_shred_xe_workload` | Reads the `.xel` set forward from a stored offset, shreds the XML, decodes the job GUID out of the Agent's `client_app_name`, and falls back to a full re-read if the offset went stale |
+| `usp_collect_job_runs` | Copies new `sysjobhistory` rows, converting the HHMMSS duration and normalising timestamps to UTC |
+| `usp_stamp_job_work` | Materializes `did_work` onto job rows while the source events still exist |
+| `usp_collect_who_is_active` | Runs `sp_WhoIsActive` into a table, then strips the sessions that are alive but not working |
+| `usp_refresh_job_inventory` | Rebuilds the map of which job steps touch a given database |
+| `usp_purge_telemetry` | Batched retention deletes |
+
+- **5 Agent jobs**, owned by the configured account:
+
+| Job | Interval | Why that interval |
+|---|---|---|
+| `… - WhoIsActive` | 1 min | The smallest an Agent schedule allows. A sampler cannot measure short queries at all — this is here to catch what *lasts* |
+| `… - Job Runs` | 2 min | `sysjobhistory` keeps only ~200 rows **per job**, so a frequent job may retain only minutes of history. A slow collector loses runs silently |
+| `… - Query Stats` | 5 min | The engine aggregates these counters itself, so nothing is lost between collections |
+| `… - XE Shred` | 5 min | The file target holds days of buffer; there is no urgency |
+| `… - Purge` | daily 04:00 | Retention, plus a refresh of the job inventory |
+
+These jobs deliberately carry **no replica guard**, unlike the application jobs they often sit alongside — see [On an Availability Group](#on-an-availability-group).
+
+## Retention
+
+Applied by `usp_purge_telemetry`, which the daily job calls with no arguments so the configured defaults apply. Deletes are batched at 50,000 rows so a backlog does not become one long transaction.
+
+| Table | Default | Cut-off column | |
+|---|---|---|---|
+| `xe_workload` | 30 days | `event_time_utc` | UTC |
+| `who_is_active` | 30 days | `collection_time` | **server local** |
+| `query_stat_delta` | 90 days | `collected_at` | UTC |
+| `job_run` | 365 days | `collected_at` | UTC |
+| `collection_run` | 60 days | `started_at` | UTC |
+| `query_text`, `capture_residue_archive` | never | — | dimension and audit tables, negligible growth |
+
+Two things worth understanding rather than just accepting:
+
+**The UTC/local split is not sloppiness.** `sp_WhoIsActive` records `collection_time` in server local time and Extended Events records in UTC. The purge honours each column's own basis. Mixing them is the single most common way to get this kind of query wrong — see the design notes.
+
+**`job_run` outliving `xe_workload` by 11 months only works because `did_work` is materialized** onto the row before the events expire. Without that, every run older than the workload window would report `did_work = 0`, indistinguishable from a genuine no-op — the exact opposite of what the flag is for.
 
 ## Requirements
 

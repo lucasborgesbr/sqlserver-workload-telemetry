@@ -1,0 +1,5 @@
+# Normalise line endings so the scripts are identical whether they are
+# cloned on Windows or Linux. sqlcmd reads LF fine on Windows.
+*.sql text eol=lf
+*.md  text eol=lf
+*     text=auto

@@ -13,6 +13,22 @@ Responde quatro perguntas sobre uma instância em produção:
 
 Construído para servir de baseline de migração, mas funciona como observabilidade de propósito geral numa instância legada.
 
+> **Antes de rodar: isto captura valores reais de parâmetro.**
+> O `xe_workload.statement_text` vai conter dado real das suas queries de produção — nomes de cliente, identificadores, o que sua aplicação passar como parâmetro. Isso é deliberado, porque caso de teste replayável precisa de valor real, mas significa que a tabela é dado de produção e possivelmente dado pessoal. Leia [Sensibilidade do dado](#sensibilidade-do-dado) antes de instalar, e coloque `collect_statement = 0` se essa troca não for aceitável no seu ambiente.
+
+## Alcance e ressalvas
+
+Sendo honesto sobre a procedência: isto foi construído e medido contra **uma** instância SQL Server 2014 SP3 Enterprise, sob carga OLTP moderada. Funciona, e todas as decisões de desenho têm medição por trás — mas essas medições vêm daquela única instância.
+
+Trate como ponto de partida, não como verdade universal:
+
+- **Os intervalos de coleta.** O intervalo de 2 minutos para job runs existe porque o `sysjobhistory` daquela instância guardava cerca de 11 minutos de histórico para o job mais frequente dela. O seu pode guardar horas, ou minutos.
+- **Os defaults de retenção e os números de dimensionamento.** Taxa de eventos varia em ordens de magnitude entre instâncias. Calcule a sua com as queries 1 e 10 depois de uma semana.
+- **A detecção de guard step.** Desligada por padrão; precisa do padrão que os seus jobs usam.
+- **O filtro de ruído do `who_is_active`.** As exclusões de `background`/`dormant`/DatabaseMail valeram naquela instância. Verifique o que as suas amostras realmente contêm antes de confiar no filtro.
+
+O que generaliza sem ressalva é a lista de modos de falha em [`docs/design-notes.pt-BR.md`](docs/design-notes.pt-BR.md). Aquilo são propriedades do SQL Server, não de uma instância específica, e a maioria falha em silêncio.
+
 ## O que coleta
 
 | Fluxo | Tabela | Conteúdo | Intervalo | Retenção padrão |
@@ -25,6 +41,55 @@ Construído para servir de baseline de migração, mas funciona como observabili
 Mais o `collection_run`, trilha de auditoria de cada execução dos coletores. Essa importa mais do que parece: sem ela, um buraco nos dados é indistinguível de um coletor que morreu em silêncio.
 
 **Qual tabela usar para quê:** o `query_stat_delta` diz *o que importa e quanto custa*; o `xe_workload` guarda *o texto completo com os valores reais*. O `query_text` é dimensão de rotulagem, truncada em 4.000 caracteres — não é fonte de query na íntegra.
+
+## O que é criado
+
+A pegada completa na instância, para você saber com o que está concordando antes de rodar o `deploy.sql`:
+
+- **Um banco** (`dba_telemetry` por padrão), `RECOVERY SIMPLE`, com 9 tabelas e 1 view. Nada é criado no `master`, no `msdb` ou nos seus bancos de aplicação.
+- **Uma event session de escopo de servidor**, `Workload_Capture`, criada parada.
+- **7 stored procedures**, todas no banco de telemetria:
+
+| Procedure | O que faz |
+|---|---|
+| `usp_collect_query_stats` | Fotografa o `sys.dm_exec_query_stats` e calcula o delta contra a foto anterior, sinalizando reset de contador para que eviction do plan cache nunca produza valor negativo |
+| `usp_shred_xe_workload` | Lê o conjunto `.xel` para frente a partir de um offset salvo, faz o shred do XML, decodifica o GUID do job do `client_app_name` do Agent, e relê do início se o offset ficou inválido |
+| `usp_collect_job_runs` | Copia novas linhas do `sysjobhistory`, convertendo a duração em HHMMSS e normalizando timestamps para UTC |
+| `usp_stamp_job_work` | Materializa o `did_work` nas linhas de job enquanto os eventos de origem ainda existem |
+| `usp_collect_who_is_active` | Roda o `sp_WhoIsActive` numa tabela e remove as sessões que estão vivas mas sem trabalho |
+| `usp_refresh_job_inventory` | Reconstrói o mapa de quais job steps tocam um determinado banco |
+| `usp_purge_telemetry` | Deletes de retenção em lote |
+
+- **5 jobs do Agent**, com o dono configurado:
+
+| Job | Intervalo | Por que esse intervalo |
+|---|---|---|
+| `… - WhoIsActive` | 1 min | O menor que uma schedule do Agent permite. Um amostrador não consegue medir query curta de forma alguma — está aqui para pegar o que *dura* |
+| `… - Job Runs` | 2 min | O `sysjobhistory` guarda só ~200 linhas **por job**, então um job frequente pode reter apenas minutos de histórico. Um coletor lento perde execuções em silêncio |
+| `… - Query Stats` | 5 min | O engine agrega esses contadores sozinho, então nada é perdido entre coletas |
+| `… - XE Shred` | 5 min | O file target tem dias de buffer; não há pressa |
+| `… - Purge` | diário 04:00 | Retenção, mais o refresh do inventário de jobs |
+
+Esses jobs deliberadamente **não têm guard de réplica**, ao contrário dos jobs de aplicação ao lado dos quais costumam ficar — veja [Em Availability Group](#em-availability-group).
+
+## Retenção
+
+Aplicada pela `usp_purge_telemetry`, que o job diário chama sem argumentos, então valem os defaults configurados. Deletes em lote de 50.000 linhas para que um acúmulo não vire uma transação longa.
+
+| Tabela | Padrão | Coluna de corte | |
+|---|---|---|---|
+| `xe_workload` | 30 dias | `event_time_utc` | UTC |
+| `who_is_active` | 30 dias | `collection_time` | **local do servidor** |
+| `query_stat_delta` | 90 dias | `collected_at` | UTC |
+| `job_run` | 365 dias | `collected_at` | UTC |
+| `collection_run` | 60 dias | `started_at` | UTC |
+| `query_text`, `capture_residue_archive` | nunca | — | tabelas de dimensão e auditoria, crescimento desprezível |
+
+Duas coisas que vale entender em vez de só aceitar:
+
+**A divisão UTC/local não é desleixo.** O `sp_WhoIsActive` grava o `collection_time` em hora local do servidor e o Extended Events grava em UTC. O purge respeita a base de cada coluna. Misturar as duas é a forma mais comum de errar esse tipo de query — veja as notas de desenho.
+
+**O `job_run` sobreviver 11 meses além do `xe_workload` só funciona porque o `did_work` é materializado** na linha antes de os eventos expirarem. Sem isso, toda execução mais antiga que a janela de workload reportaria `did_work = 0`, indistinguível de um no-op de verdade — exatamente o oposto do propósito da flag.
 
 ## Requisitos
 
