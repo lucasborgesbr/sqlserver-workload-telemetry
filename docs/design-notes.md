@@ -31,6 +31,41 @@ Capture without a positive database filter and filter offline, where the decisio
 
 Measured on a real instance: **17,099 events with `writes = 0` had touched 389,583 rows**, because the pages involved were already cached. Any filter or heuristic built on `writes` alone will therefore discard or misclassify most real work.
 
+## dm_exec_sql_text returns the whole batch, not the statement
+
+`sys.dm_exec_sql_text(sql_handle)` returns the entire batch text. For a statement inside a stored procedure or function, that is **the whole object definition** — the full `CREATE PROCEDURE` source, including any `DROP` preamble the author left in it.
+
+Store that verbatim and `query_text` ends up holding the object's DDL instead of the query. Measured on a real instance before the fix: **19 of 21 procedure entries contained `CREATE PROCEDURE` / `CREATE FUNCTION` / `DROP PROCEDURE`** rather than a statement. The weights were right; the text next to them was useless.
+
+The fix is the documented offset slice, which needs **both** offsets from the DMV:
+
+```sql
+SUBSTRING(st.text,
+          (c.statement_start_offset / 2) + 1,
+          ((CASE c.statement_end_offset
+                 WHEN -1 THEN DATALENGTH(st.text)
+                 ELSE c.statement_end_offset
+            END - c.statement_start_offset) / 2) + 1)
+```
+
+The offsets are byte offsets into an `nvarchar`, hence the division by two. `statement_end_offset = -1` means "to the end of the batch".
+
+One trap inside the trap: `MIN`/`MAX` do not accept `nvarchar(max)`, so an aggregate over the text does not compile. Working around that with `MIN(LEFT(st.text, 4000))` compiles fine and silently truncates — measured at **12.6% of templates** hitting the ceiling, concentrated in exactly the verbose ORM-generated queries most worth reading. Use `ROW_NUMBER()` to pick one row per hash instead of aggregating.
+
+## counter_reset means the delta is not a delta
+
+On a row where `counter_reset = 1`, the `delta_*` columns hold the **cumulative** value, not an interval difference. That is deliberate: it is how the collector avoids emitting negative deltas when a plan is recompiled or evicted from cache and the engine's counters restart.
+
+The consequence is that `SUM(delta_executions)` without a filter double-counts. Measured on a real instance: **12% of rows were resets, inflating total executions by about 4% overall and up to 15% on individual templates.** Enough to reorder a ranking, not enough for anyone to notice.
+
+Always filter:
+
+```sql
+AND counter_reset = 0
+```
+
+Note also which templates are most exposed: anything whose plan is invalidated on a schedule. A weekly `UPDATE STATISTICS ... WITH FULLSCAN` on a large table invalidates every plan touching it, so the procedures against that table carry the most reset rows — and those are usually the ones at the top of the ranking.
+
 ## did_work is a heuristic, and its definition matters
 
 The goal is to distinguish a job run that processed something from one that finished in 0 seconds because its queue was empty. There is no flag for this — a conditional job whose work set is empty simply does nothing and reports success.

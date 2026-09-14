@@ -31,6 +31,41 @@ O `writes` no `rpc_completed` e no `sql_batch_completed` é contagem de **págin
 
 Medido numa instância real: **17.099 eventos com `writes = 0` tocaram 389.583 linhas**, porque as páginas envolvidas já estavam em cache. Qualquer filtro ou heurística construída só sobre `writes` vai, portanto, descartar ou classificar errado a maior parte do trabalho real.
 
+## dm_exec_sql_text devolve o batch inteiro, não o statement
+
+O `sys.dm_exec_sql_text(sql_handle)` devolve o texto do batch inteiro. Para um statement dentro de stored procedure ou função, isso é **a definição completa do objeto** — o fonte inteiro do `CREATE PROCEDURE`, incluindo qualquer `DROP` de preâmbulo que o autor tenha deixado ali.
+
+Guardar isso como está faz o `query_text` conter o DDL do objeto em vez da consulta. Medido numa instância real antes da correção: **19 de 21 entradas de procedure continham `CREATE PROCEDURE` / `CREATE FUNCTION` / `DROP PROCEDURE`** em vez de um statement. Os pesos estavam certos; o texto ao lado deles era inútil.
+
+A correção é o recorte documentado por offset, que exige **os dois** offsets da DMV:
+
+```sql
+SUBSTRING(st.text,
+          (c.statement_start_offset / 2) + 1,
+          ((CASE c.statement_end_offset
+                 WHEN -1 THEN DATALENGTH(st.text)
+                 ELSE c.statement_end_offset
+            END - c.statement_start_offset) / 2) + 1)
+```
+
+Os offsets são em bytes sobre um `nvarchar`, daí a divisão por dois. `statement_end_offset = -1` significa "até o fim do batch".
+
+Uma armadilha dentro da armadilha: `MIN`/`MAX` não aceitam `nvarchar(max)`, então agregado sobre o texto não compila. Contornar isso com `MIN(LEFT(st.text, 4000))` compila perfeitamente e trunca em silêncio — medido em **12,6% dos templates** batendo no teto, concentrados justamente nas consultas verbosas geradas por ORM, que são as mais importantes de ler. Use `ROW_NUMBER()` para escolher uma linha por hash em vez de agregar.
+
+## counter_reset significa que o delta não é delta
+
+Numa linha com `counter_reset = 1`, as colunas `delta_*` carregam o valor **cumulativo**, não a diferença do intervalo. Isso é deliberado: é assim que o coletor evita emitir delta negativo quando um plano é recompilado ou sai do cache e os contadores do engine reiniciam.
+
+A consequência é que `SUM(delta_executions)` sem filtro conta em dobro. Medido numa instância real: **12% das linhas eram resets, inflando o total de execuções em cerca de 4% no agregado e até 15% em templates individuais.** Suficiente para reordenar um ranking, insuficiente para alguém notar.
+
+Sempre filtre:
+
+```sql
+AND counter_reset = 0
+```
+
+Observe também quais templates ficam mais expostos: qualquer um cujo plano seja invalidado periodicamente. Um `UPDATE STATISTICS ... WITH FULLSCAN` semanal numa tabela grande invalida todo plano que a toca, então as procedures contra aquela tabela carregam mais linhas de reset — e normalmente são as que aparecem no topo do ranking.
+
 ## did_work é heurística, e a definição importa
 
 O objetivo é distinguir uma execução de job que processou algo de uma que terminou em 0 segundos porque a fila estava vazia. Não existe flag para isso — um job condicional cujo conjunto de trabalho está vazio simplesmente não faz nada e reporta sucesso.

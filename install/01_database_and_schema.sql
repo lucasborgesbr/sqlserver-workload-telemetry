@@ -43,19 +43,36 @@ GO
    Query text dimension. Keyed by query_hash so the text is stored once per
    query shape rather than repeated in every snapshot row.
 
-   Deliberately truncated to 4000 characters: this exists to LABEL aggregated
-   rows, not to be a source of full query text. Full text with real parameter
-   values lives in xe_workload.statement_text.
+   query_text holds the complete statement, sliced out of the batch or object
+   definition using the DMV's statement offsets. It is NOT the whole object
+   definition and it is NOT truncated — both were earlier defects, described
+   in docs/design-notes.
+
+   Note this is the PARAMETERIZED shape, with the parameter declaration
+   prefix, e.g. "(@P1 varchar(16))SELECT ...". Real parameter VALUES live in
+   xe_workload.statement_text.
+
+   needs_recapture marks a row whose text is known or suspected to be wrong,
+   so the collector will overwrite it the next time that plan is in cache.
+   Without it the insert guard would mean a row captured badly stays bad
+   forever. It also recovers rows whose text was missed because the plan left
+   the cache before a collection.
    --------------------------------------------------------------------------- */
 IF OBJECT_ID('dbo.query_text') IS NULL
 CREATE TABLE dbo.query_text (
-    query_hash  binary(8)     NOT NULL PRIMARY KEY,
-    query_text  nvarchar(max) NULL,
-    db_name     sysname       NULL,
-    object_name sysname       NULL,
-    first_seen  datetime2(3)  NOT NULL DEFAULT (SYSUTCDATETIME()),
-    last_seen   datetime2(3)  NOT NULL DEFAULT (SYSUTCDATETIME())
+    query_hash      binary(8)     NOT NULL PRIMARY KEY,
+    query_text      nvarchar(max) NULL,
+    db_name         sysname       NULL,
+    object_name     sysname       NULL,   -- non-null only for statements in objects
+    needs_recapture bit           NOT NULL DEFAULT (0),
+    captured_by     varchar(20)   NULL,   -- provenance of the text
+    first_seen      datetime2(3)  NOT NULL DEFAULT (SYSUTCDATETIME()),
+    last_seen       datetime2(3)  NOT NULL DEFAULT (SYSUTCDATETIME())
 );
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_query_text_recapture')
+    CREATE NONCLUSTERED INDEX ix_query_text_recapture
+        ON dbo.query_text (needs_recapture) WHERE needs_recapture = 1;
 GO
 
 /* ---------------------------------------------------------------------------

@@ -26,17 +26,22 @@ BEGIN
 
     BEGIN TRY
         CREATE TABLE #cur (
-            plan_handle varbinary(64), statement_start_offset int, creation_time datetime2(3),
-            query_hash binary(8), query_plan_hash binary(8), dbid int, sql_handle varbinary(64),
+            plan_handle varbinary(64), statement_start_offset int, statement_end_offset int,
+            creation_time datetime2(3), query_hash binary(8), query_plan_hash binary(8),
+            dbid int, sql_handle varbinary(64),
             execution_count bigint, total_worker_time bigint, total_elapsed_time bigint,
             total_logical_reads bigint, total_physical_reads bigint, total_writes bigint,
             total_rows bigint
         );
 
-        /* The DMV column is total_logical_writes, not total_writes. */
+        /* Two traps in this SELECT. The DMV column is total_logical_writes,
+           not total_writes. And statement_end_offset is required — without it
+           the statement cannot be sliced out of the object definition further
+           down, which was the original cause of proc text being captured as
+           the object's DDL. */
         INSERT INTO #cur
-        SELECT qs.plan_handle, qs.statement_start_offset, qs.creation_time,
-               qs.query_hash, qs.query_plan_hash, da.dbid, qs.sql_handle,
+        SELECT qs.plan_handle, qs.statement_start_offset, qs.statement_end_offset,
+               qs.creation_time, qs.query_hash, qs.query_plan_hash, da.dbid, qs.sql_handle,
                qs.execution_count, qs.total_worker_time, qs.total_elapsed_time,
                qs.total_logical_reads, qs.total_physical_reads, qs.total_logical_writes,
                qs.total_rows
@@ -76,20 +81,65 @@ BEGIN
            OR c.execution_count > p.execution_count;
         SET @rows = @@ROWCOUNT;
 
-        /* Text is fetched only for query hashes not already known, so the plan
-           cache is not re-read on every collection. Truncated at 4000 chars on
-           purpose: this labels shapes, it is not a source of full text. */
-        INSERT INTO dbo.query_text (query_hash, query_text, db_name, object_name)
-        SELECT x.query_hash, x.txt, DB_NAME(x.dbid), x.obj
-        FROM (SELECT c.query_hash,
-                     MIN(c.dbid)                            AS dbid,
-                     MIN(LEFT(st.text, 4000))               AS txt,
-                     MIN(OBJECT_NAME(st.objectid, st.dbid)) AS obj
-              FROM #cur c
-              CROSS APPLY sys.dm_exec_sql_text(c.sql_handle) st
-              WHERE c.query_hash IS NOT NULL
-                AND NOT EXISTS (SELECT 1 FROM dbo.query_text qt WHERE qt.query_hash = c.query_hash)
-              GROUP BY c.query_hash) x;
+        /* --- statement text, one row per query_hash ------------------------
+           sys.dm_exec_sql_text(sql_handle) returns the ENTIRE batch, and for a
+           statement inside a procedure it returns the whole object definition.
+           Storing that verbatim captures the object's DDL instead of the
+           statement — measured on a real instance as 19 of 21 procedure
+           entries containing CREATE/DROP PROCEDURE. The offset pair is what
+           slices the actual statement out; statement_end_offset = -1 means
+           "to the end of the batch".
+
+           ROW_NUMBER rather than MIN() because MIN does not accept
+           nvarchar(max). Working around that with MIN(LEFT(text, 4000)) was
+           what silently truncated 12.6% of templates. */
+        CREATE TABLE #txt (
+            query_hash  binary(8) PRIMARY KEY,
+            stmt_text   nvarchar(max),
+            dbid        int,
+            object_name sysname NULL
+        );
+
+        INSERT INTO #txt (query_hash, stmt_text, dbid, object_name)
+        SELECT x.query_hash, x.stmt_text, x.dbid, x.object_name
+        FROM (
+            SELECT c.query_hash,
+                   SUBSTRING(st.text,
+                             (c.statement_start_offset / 2) + 1,
+                             ((CASE c.statement_end_offset
+                                    WHEN -1 THEN DATALENGTH(st.text)
+                                    ELSE c.statement_end_offset
+                               END - c.statement_start_offset) / 2) + 1) AS stmt_text,
+                   c.dbid,
+                   OBJECT_NAME(st.objectid, st.dbid)                     AS object_name,
+                   ROW_NUMBER() OVER (PARTITION BY c.query_hash
+                                      ORDER BY c.execution_count DESC)   AS rn
+            FROM #cur c
+            CROSS APPLY sys.dm_exec_sql_text(c.sql_handle) st
+            WHERE c.query_hash IS NOT NULL
+              AND st.text IS NOT NULL
+        ) x
+        WHERE x.rn = 1;
+
+        /* New hashes only, so the plan cache is not re-read every collection. */
+        INSERT INTO dbo.query_text
+              (query_hash, query_text, db_name, object_name, needs_recapture, captured_by)
+        SELECT t.query_hash, t.stmt_text, DB_NAME(t.dbid), t.object_name, 0, 'stmt-offset'
+        FROM #txt t
+        WHERE NOT EXISTS (SELECT 1 FROM dbo.query_text qt WHERE qt.query_hash = t.query_hash);
+
+        /* Recapture: rows flagged as wrong or missing, whose plan is back in
+           cache. This is what makes a bad capture recoverable at all. */
+        UPDATE qt
+           SET query_text      = t.stmt_text,
+               object_name     = t.object_name,
+               db_name         = ISNULL(DB_NAME(t.dbid), qt.db_name),
+               needs_recapture = 0,
+               captured_by     = 'stmt-offset',
+               last_seen       = @now
+        FROM dbo.query_text qt
+        JOIN #txt t ON t.query_hash = qt.query_hash
+        WHERE qt.needs_recapture = 1;
 
         UPDATE qt SET last_seen = @now
         FROM dbo.query_text qt

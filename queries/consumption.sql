@@ -37,6 +37,14 @@ ORDER BY collector;
    2. Most frequently executed queries.
    Order by x.cpu_seconds DESC instead for the most expensive by CPU.
    Add  AND d.db_name <> 'msdb'  to drop Agent bookkeeping.
+
+   NOTE the counter_reset = 0 predicate, and do not drop it. On a reset row
+   the delta_* columns hold the CUMULATIVE value, not an interval delta — that
+   is how the collector avoids emitting negatives when a plan is recompiled or
+   evicted. Summing without the filter therefore double-counts. Measured on a
+   real instance: 12% of rows were resets, inflating total executions by 4%
+   overall and up to 15% on individual templates. Enough to distort a ranking,
+   not enough to be obvious.
    --------------------------------------------------------------------------- */
 SELECT TOP 25
        x.db_name, x.executions, x.cpu_seconds, x.avg_cpu_ms, x.logical_reads,
@@ -53,10 +61,29 @@ FROM (
     FROM dbo.query_stat_delta d
     WHERE d.collected_at     > DATEADD(day, -7, SYSUTCDATETIME())
       AND d.delta_executions > 0
+      AND d.counter_reset    = 0          -- see note above; do not remove
     GROUP BY d.query_hash
 ) x
 LEFT JOIN dbo.query_text t ON t.query_hash = x.query_hash
 ORDER BY x.executions DESC;
+
+
+/* ---------------------------------------------------------------------------
+   2b. Text capture health.
+
+   needs_recapture = 1 means the stored text is known or suspected wrong and
+   the collector will overwrite it the next time that plan is in cache. Rows
+   that stay pending for a long time belong to queries whose plan rarely
+   returns to cache; their text is the best available, not the correct one.
+   --------------------------------------------------------------------------- */
+SELECT ISNULL(captured_by, '(unknown)')                                  AS captured_by,
+       COUNT(*)                                                          AS templates,
+       SUM(CONVERT(int, needs_recapture))                                AS pending_recapture,
+       SUM(CASE WHEN object_name IS NOT NULL THEN 1 ELSE 0 END)          AS inside_objects,
+       MAX(DATALENGTH(query_text) / 2)                                    AS longest_chars
+FROM dbo.query_text
+GROUP BY captured_by
+ORDER BY COUNT(*) DESC;
 
 
 /* ---------------------------------------------------------------------------

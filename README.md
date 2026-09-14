@@ -40,7 +40,14 @@ What generalises without qualification is the list of failure modes in [`docs/de
 
 Plus `collection_run`, an audit trail of every collector execution. That one matters more than it looks: without it, a gap in the data is indistinguishable from a collector that quietly died.
 
-**Which table to use for what:** `query_stat_delta` tells you *what matters and what it costs*; `xe_workload` holds *the full text with the actual values*. `query_text` is a labelling dimension, truncated at 4,000 characters — it is not a source of complete queries.
+**Which table to use for what:**
+
+- `query_stat_delta` + `query_text` → *what matters, what it costs, and the query's shape.* Weight comes from `delta_executions`; shape from `query_text`, which holds the complete parameterized statement with its parameter declaration prefix, e.g. `(@P1 varchar(16))SELECT ...`. Filter `counter_reset = 0` when summing — see the design notes for why.
+- `xe_workload` → *the full statement as executed, with real parameter values.* This is the only source of actual values, and the only place to see what a client sent rather than what the engine cached.
+
+The two cannot be joined on a key: `xe_workload` has no `query_hash`. Linking a weighted template to real parameter values means matching on normalised text. That is a deliberate consequence of the granularity split described below, not an oversight.
+
+**They also see different things.** `query_stat_delta` records statements *inside* procedures and functions; `xe_workload` records only the *outer* call. A procedure invoked by a job appears in the former as one row per internal statement, and in the latter as a single batch whose text is just the `EXEC`. Searching `xe_workload` for a procedure's internal SQL returns nothing, and that is correct behaviour.
 
 ## What gets created
 
@@ -164,6 +171,7 @@ config.example.sql      copy to config.sql and edit
 deploy.sql              runs every install script in order
 install/                01 schema · 02 collectors · 03 who_is_active
                         04 event session · 05 Agent jobs · 06 retention
+migrations/             upgrades for installations made before a fix
 uninstall/99_teardown   removes everything (guarded)
 queries/consumption.sql 10 queries for reading the data
 docs/design-notes.md    the traps, and why the design is what it is

@@ -40,7 +40,14 @@ O que generaliza sem ressalva é a lista de modos de falha em [`docs/design-note
 
 Mais o `collection_run`, trilha de auditoria de cada execução dos coletores. Essa importa mais do que parece: sem ela, um buraco nos dados é indistinguível de um coletor que morreu em silêncio.
 
-**Qual tabela usar para quê:** o `query_stat_delta` diz *o que importa e quanto custa*; o `xe_workload` guarda *o texto completo com os valores reais*. O `query_text` é dimensão de rotulagem, truncada em 4.000 caracteres — não é fonte de query na íntegra.
+**Qual tabela usar para quê:**
+
+- `query_stat_delta` + `query_text` → *o que importa, quanto custa, e a forma da consulta.* O peso vem de `delta_executions`; a forma vem do `query_text`, que guarda o statement parametrizado completo com o prefixo de declaração de parâmetros, por exemplo `(@P1 varchar(16))SELECT ...`. Filtre `counter_reset = 0` ao somar — as notas de desenho explicam por quê.
+- `xe_workload` → *o statement como foi executado, com os valores reais de parâmetro.* É a única fonte de valores de verdade, e o único lugar onde se vê o que o cliente enviou em vez do que o engine cacheou.
+
+As duas não podem ser unidas por chave: o `xe_workload` não tem `query_hash`. Ligar um template ponderado a valores reais de parâmetro exige casamento por texto normalizado. Isso é consequência deliberada da divisão de granularidade descrita abaixo, não descuido.
+
+**E elas enxergam coisas diferentes.** O `query_stat_delta` registra statements *dentro* de procedures e funções; o `xe_workload` registra apenas a *chamada externa*. Uma procedure invocada por um job aparece na primeira como uma linha por statement interno, e na segunda como um único batch cujo texto é só o `EXEC`. Procurar no `xe_workload` o SQL interno de uma procedure devolve nada, e isso é comportamento correto.
 
 ## O que é criado
 
@@ -164,6 +171,7 @@ config.example.sql      copie para config.sql e edite
 deploy.sql              roda todos os scripts de instalação em ordem
 install/                01 schema · 02 coletores · 03 who_is_active
                         04 event session · 05 jobs do Agent · 06 retenção
+migrations/             atualizações para instalações feitas antes de uma correção
 uninstall/99_teardown   remove tudo (com guarda de confirmação)
 queries/consumption.sql 10 queries para ler os dados
 docs/design-notes*.md   as armadilhas, e por que o desenho é o que é
