@@ -20,6 +20,7 @@
 :r install/04_xevent_session.sql
 :r install/05_agent_jobs.sql
 :r install/06_purge.sql
+:r install/07_param_sampler.sql
 GO
 PRINT '';
 PRINT '--------------------------------------------------------------------';

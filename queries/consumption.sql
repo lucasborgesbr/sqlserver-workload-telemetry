@@ -6,11 +6,14 @@
      run_started_at, collection_time                -> LOCAL   -> GETDATE()
 
    Which table answers what:
-     query_stat_delta + query_text  -> WHAT matters and WHAT IT COSTS
-                                       (execution counts, CPU) — aggregated
-     xe_workload                    -> the FULL statement text WITH real
-                                       parameter values, plus per-event
+     query_stat_delta + query_text  -> WHAT matters, WHAT IT COSTS, and the
+                                       query's SHAPE — aggregated, weighted
+     xe_workload                    -> the FULL statement as executed, WITH
+                                       real parameter values, plus per-event
                                        duration and I/O
+     param_sample                   -> parameter VALUES per shape, already
+                                       reduced. Use this instead of scanning
+                                       xe_workload for values.
      job_run / vw_job_run_effective -> job durations and did_work
      who_is_active                  -> long-running and blocking
    ============================================================================ */
@@ -249,3 +252,49 @@ JOIN sys.allocation_units a ON a.container_id = p.partition_id
 WHERE i.index_id IN (0, 1)
 GROUP BY t.name, p.rows
 ORDER BY SUM(a.total_pages) DESC;
+
+
+/* ---------------------------------------------------------------------------
+   11. Parameter value samples, ready to feed a replay harness.
+
+   Joins the three things a replayable workload needs: weight from
+   query_stat_delta, shape from query_text, values from param_sample.
+
+   value_segment is the raw slice that CONTAINS the values, not one value per
+   column — see install/07 for why that split is left to the consumer.
+   --------------------------------------------------------------------------- */
+SELECT TOP 50
+       w.executions,
+       ps.param_decl,
+       COUNT(*)                                    AS distinct_values_sampled,
+       MIN(ps.event_time_utc)                      AS first_seen,
+       MAX(ps.event_time_utc)                      AS last_seen,
+       CONVERT(nvarchar(160), MIN(ps.stmt_prefix)) AS body_prefix
+FROM dbo.param_sample ps
+JOIN (
+    SELECT query_hash, SUM(delta_executions) AS executions
+    FROM dbo.query_stat_delta
+    WHERE collected_at  > DATEADD(day, -7, SYSUTCDATETIME())
+      AND counter_reset = 0
+    GROUP BY query_hash
+) w ON w.query_hash = ps.query_hash
+GROUP BY w.executions, ps.param_decl
+ORDER BY w.executions DESC;
+
+
+/* ---------------------------------------------------------------------------
+   11b. Sampler health and coverage.
+
+   parse_status other than ok/ok_no_params means the wrapper did not match the
+   expected shape. A rising count there means the client changed how it sends
+   statements, and the parser needs revisiting.
+   --------------------------------------------------------------------------- */
+SELECT parse_status,
+       COUNT(*)                                                   AS samples,
+       COUNT(DISTINCT stmt_prefix)                                AS distinct_shapes,
+       SUM(CASE WHEN query_hash IS NOT NULL THEN 1 ELSE 0 END)    AS matched_to_template,
+       CAST(100.0 * SUM(CASE WHEN query_hash IS NOT NULL THEN 1 ELSE 0 END)
+            / NULLIF(COUNT(*), 0) AS decimal(5,1))                AS pct_matched
+FROM dbo.param_sample
+GROUP BY parse_status
+ORDER BY COUNT(*) DESC;

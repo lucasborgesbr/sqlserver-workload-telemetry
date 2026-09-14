@@ -15,12 +15,13 @@ GO
 IF OBJECT_ID('dbo.usp_purge_telemetry') IS NOT NULL DROP PROCEDURE dbo.usp_purge_telemetry;
 GO
 CREATE PROCEDURE dbo.usp_purge_telemetry
-    @keep_days_workload    int = $(KeepDaysWorkload),
-    @keep_days_querystats  int = $(KeepDaysQueryStats),
-    @keep_days_whoisactive int = $(KeepDaysWhoIsActive),
-    @keep_days_jobruns     int = $(KeepDaysJobRuns),
-    @keep_days_collections int = 60,
-    @batch_size            int = 50000
+    @keep_days_workload     int = $(KeepDaysWorkload),
+    @keep_days_querystats   int = $(KeepDaysQueryStats),
+    @keep_days_whoisactive  int = $(KeepDaysWhoIsActive),
+    @keep_days_jobruns      int = $(KeepDaysJobRuns),
+    @keep_days_paramsamples int = $(KeepDaysParamSamples),
+    @keep_days_collections  int = 60,
+    @batch_size             int = 50000
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -67,6 +68,19 @@ BEGIN
             DELETE TOP (@batch_size) FROM dbo.job_run
              WHERE collected_at < DATEADD(day, -@keep_days_jobruns, SYSUTCDATETIME());
             SET @n = @@ROWCOUNT; SET @deleted += @n;
+        END
+
+        /* Guarded on existence so the deploy order of install/06 and
+           install/07 does not matter. */
+        IF OBJECT_ID('dbo.param_sample') IS NOT NULL
+        BEGIN
+            SET @n = 1;
+            WHILE @n > 0
+            BEGIN
+                DELETE TOP (@batch_size) FROM dbo.param_sample
+                 WHERE collected_at < DATEADD(day, -@keep_days_paramsamples, SYSUTCDATETIME());
+                SET @n = @@ROWCOUNT; SET @deleted += @n;
+            END
         END
 
         DELETE FROM dbo.collection_run

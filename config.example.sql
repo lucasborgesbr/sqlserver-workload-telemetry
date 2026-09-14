@@ -63,8 +63,15 @@
 -- it means is_guard_step is always 0 until you configure it.
 :setvar GuardStepPattern   "%__configure_guard_step_pattern__%"
 
+-- Client application whose parameter values the sampler extracts (install/07).
+-- Must match client_app_name exactly. This is the application whose workload
+-- you want to be able to replay — typically the one issuing prepared
+-- statements through an ORM.
+:setvar SampleClientApp    "YourAppClientName"
+
 -- Retention in days, applied by install/06 and the purge job.
-:setvar KeepDaysWorkload    "30"
-:setvar KeepDaysQueryStats  "90"
-:setvar KeepDaysWhoIsActive "30"
-:setvar KeepDaysJobRuns     "365"
+:setvar KeepDaysWorkload     "30"
+:setvar KeepDaysQueryStats   "90"
+:setvar KeepDaysWhoIsActive  "30"
+:setvar KeepDaysJobRuns      "365"
+:setvar KeepDaysParamSamples "180"

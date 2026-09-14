@@ -37,6 +37,7 @@ What generalises without qualification is the list of failure modes in [`docs/de
 | Aggregated query stats | `query_stat_delta` + `query_text` | Per-interval delta of executions, CPU, reads and writes by `query_hash` — the Query Store substitute | 5 min | 90 days |
 | Job executions | `job_run`, view `vw_job_run_effective` | Real duration in seconds, status, guard-step flag, and `did_work` | 2 min | 365 days |
 | Active request sampling | `who_is_active` | Long-running, blocked and blocking requests | 1 min | 30 days |
+| Parameter values | `param_sample` | Real parameter values per query shape, pulled out of prepared-statement wrappers and reduced to compact rows — so nothing ever has to scan the workload table looking for values | 1 h | 180 days |
 
 Plus `collection_run`, an audit trail of every collector execution. That one matters more than it looks: without it, a gap in the data is indistinguishable from a collector that quietly died.
 
@@ -53,9 +54,9 @@ The two cannot be joined on a key: `xe_workload` has no `query_hash`. Linking a 
 
 The full footprint on the instance, so you know what you are agreeing to before running `deploy.sql`:
 
-- **One database** (`dba_telemetry` by default), `RECOVERY SIMPLE`, holding 9 tables and 1 view. Nothing is created in `master`, `msdb` or your application databases.
+- **One database** (`dba_telemetry` by default), `RECOVERY SIMPLE`, holding 10 tables and 1 view. Nothing is created in `master`, `msdb` or your application databases.
 - **One server-scoped event session**, `Workload_Capture`, created stopped.
-- **7 stored procedures**, all in the telemetry database:
+- **8 stored procedures**, all in the telemetry database:
 
 | Procedure | What it does |
 |---|---|
@@ -65,9 +66,10 @@ The full footprint on the instance, so you know what you are agreeing to before 
 | `usp_stamp_job_work` | Materializes `did_work` onto job rows while the source events still exist |
 | `usp_collect_who_is_active` | Runs `sp_WhoIsActive` into a table, then strips the sessions that are alive but not working |
 | `usp_refresh_job_inventory` | Rebuilds the map of which job steps touch a given database |
+| `usp_collect_param_samples` | Samples real parameter values out of prepared-statement wrappers, reducing millions of LOB-bearing rows to a few thousand compact ones |
 | `usp_purge_telemetry` | Batched retention deletes |
 
-- **5 Agent jobs**, owned by the configured account:
+- **6 Agent jobs**, owned by the configured account:
 
 | Job | Interval | Why that interval |
 |---|---|---|
@@ -75,6 +77,7 @@ The full footprint on the instance, so you know what you are agreeing to before 
 | `… - Job Runs` | 2 min | `sysjobhistory` keeps only ~200 rows **per job**, so a frequent job may retain only minutes of history. A slow collector loses runs silently |
 | `… - Query Stats` | 5 min | The engine aggregates these counters itself, so nothing is lost between collections |
 | `… - XE Shred` | 5 min | The file target holds days of buffer; there is no urgency |
+| `… - Param Samples` | 1 h | Each run accumulates coverage of rarer query shapes, so hourly converges instead of needing one big extraction |
 | `… - Purge` | daily 04:00 | Retention, plus a refresh of the job inventory |
 
 These jobs deliberately carry **no replica guard**, unlike the application jobs they often sit alongside — see [On an Availability Group](#on-an-availability-group).
@@ -89,6 +92,7 @@ Applied by `usp_purge_telemetry`, which the daily job calls with no arguments so
 | `who_is_active` | 30 days | `collection_time` | **server local** |
 | `query_stat_delta` | 90 days | `collected_at` | UTC |
 | `job_run` | 365 days | `collected_at` | UTC |
+| `param_sample` | 180 days | `collected_at` | UTC |
 | `collection_run` | 60 days | `started_at` | UTC |
 | `query_text`, `capture_residue_archive` | never | — | dimension and audit tables, negligible growth |
 

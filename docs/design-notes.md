@@ -143,6 +143,48 @@ A Service Broker queue reader, or anything else sitting in `WAITFOR`, reports a 
 
 That is a large part of why msdb is excluded, but it is not exclusive to msdb — check any outlier for `cpu_time_us` near zero alongside a huge `duration_us` before concluding you have found a slow query.
 
+## Parsing the sp_prepexec wrapper
+
+A client using prepared statements does not send your query — it sends a wrapper around it:
+
+```sql
+declare @p1 int
+set @p1=1
+exec sp_prepexec @p1 output,
+  N'@P1 datetime2',                          -- declaration
+  N'SELECT ... WHERE x > @P1 ORDER BY ...',   -- body
+  '2026-09-10 08:51:41.9837400'               -- values
+select @p1                                    -- always last
+```
+
+Three consequences worth knowing before writing any analysis over this text:
+
+**Roughly half the captured events carry no workload information.** Every prepare is matched by an `sp_unprepare`, which has no statement in it. Discard those before counting anything.
+
+**Every execution produces a unique `statement_text`,** because the values are embedded in the wrapper. A naive `GROUP BY statement_text` therefore reports almost entirely single executions and looks like a long tail when it is not one.
+
+**The wrapper is good news for replay, though.** It hands you the parameterised template, the parameter *types*, and a realistic value in one string — exactly what a replay harness needs.
+
+Two traps if you parse it in T-SQL:
+
+- **When the statement takes no parameters, `sp_prepexec` receives `NULL` in the declaration position.** The first `N'` you find is then the body, not a declaration. Extract it as the declaration and you will pull the whole query into a small column and get "String or binary data would be truncated" — which is the *good* outcome; the bad one is a column wide enough to accept it silently. A declaration always starts with `@`; check for it.
+- **The body contains the word `select`,** so locating the wrapper's trailing `select @p1` must use the *last* occurrence, not the first. `REVERSE` plus `CHARINDEX` does it.
+
+And know when to stop: statement bodies and values can both contain escaped single quotes, so fully delimiting the value list with `CHARINDEX` produces silent garbage on the cases it cannot handle. The right division of labour is to use SQL for the *volume reduction* — millions of LOB-bearing rows down to a few thousand compact ones — and do the final split wherever a real parser is available.
+
+## Index keys have a 900-byte limit, and HASHBYTES lies about its width
+
+Two natural keys in this kind of tooling exceed the limit: a file path plus offset, and a statement prefix plus value segment. The fix is to key on a hash instead, but there is a catch.
+
+`HASHBYTES` is typed as `varbinary(8000)` regardless of the algorithm, even though `SHA2_256` always returns 32 bytes. A computed column over it therefore still trips the index key length check. Cast it explicitly:
+
+```sql
+ALTER TABLE dbo.example ADD shape_hash AS
+    CAST(HASHBYTES('SHA2_256', ISNULL(a, N'') + N'|' + ISNULL(b, N'')) AS varbinary(32)) PERSISTED;
+```
+
+Note also that on SQL Server 2014 `HASHBYTES` rejects inputs over 8,000 bytes, so hash a bounded prefix rather than an `nvarchar(max)`.
+
 ## SQL Server 2014 syntax limits
 
 Encountered while writing this, all applicable to 2014 and 2012:

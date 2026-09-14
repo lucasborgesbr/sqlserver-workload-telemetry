@@ -19,7 +19,7 @@ DECLARE @jobs TABLE (
     step_name   sysname,
     command     nvarchar(1000),
     sched_name  sysname,
-    subday_type int,          -- 1 = at a fixed time, 4 = every N minutes
+    subday_type int,          -- 1 = fixed time, 4 = every N minutes, 8 = every N hours
     subday_int  int,
     start_time  int,
     rationale   nvarchar(400)
@@ -46,6 +46,11 @@ VALUES
   N'EXEC [$(TelemetryDatabase)].dbo.usp_shred_xe_workload;',
   N'$(JobPrefix) Shred - 5 min', 4, 5, 0,
   N'The file target holds several days of buffer, so there is no urgency.'),
+
+ (N'$(JobPrefix) - Param Samples', N'Collect param samples',
+  N'EXEC [$(TelemetryDatabase)].dbo.usp_collect_param_samples;',
+  N'$(JobPrefix) ParamSamples - hourly', 8, 1, 300,
+  N'Samples real parameter values out of sp_prepexec wrappers, reducing the workload table to compact rows. Hourly because each run accumulates coverage of rarer query shapes.'),
 
  (N'$(JobPrefix) - Purge', N'Purge and refresh inventory',
   N'EXEC [$(TelemetryDatabase)].dbo.usp_purge_telemetry; EXEC [$(TelemetryDatabase)].dbo.usp_refresh_job_inventory;',

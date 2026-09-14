@@ -143,6 +143,48 @@ Um leitor de fila do Service Broker, ou qualquer outra coisa parada em `WAITFOR`
 
 Essa é grande parte do motivo pelo qual o msdb é excluído, mas não é exclusivo do msdb — verifique em qualquer outlier se o `cpu_time_us` está perto de zero junto com um `duration_us` enorme antes de concluir que achou uma query lenta.
 
+## Parsear o wrapper sp_prepexec
+
+Um cliente que usa prepared statements não envia sua consulta — envia um wrapper em volta dela:
+
+```sql
+declare @p1 int
+set @p1=1
+exec sp_prepexec @p1 output,
+  N'@P1 datetime2',                          -- declaração
+  N'SELECT ... WHERE x > @P1 ORDER BY ...',   -- corpo
+  '2026-09-10 08:51:41.9837400'               -- valores
+select @p1                                    -- sempre o último
+```
+
+Três consequências que vale saber antes de escrever qualquer análise sobre esse texto:
+
+**Cerca de metade dos eventos capturados não carrega informação de carga.** Todo prepare tem um `sp_unprepare` correspondente, que não tem statement nenhum. Descarte antes de contar qualquer coisa.
+
+**Cada execução produz um `statement_text` único,** porque os valores ficam embutidos no wrapper. Um `GROUP BY statement_text` ingênuo reporta quase só execuções unitárias e parece uma cauda longa sem ser.
+
+**Mas o wrapper é boa notícia para replay.** Ele entrega o template parametrizado, os *tipos* dos parâmetros, e um valor realista numa única string — exatamente o que um harness de replay precisa.
+
+Duas armadilhas ao parsear em T-SQL:
+
+- **Quando o statement não tem parâmetros, o `sp_prepexec` recebe `NULL` na posição da declaração.** O primeiro `N'` encontrado passa a ser o corpo, não uma declaração. Extraia como declaração e você puxa a consulta inteira para uma coluna pequena e recebe "String or binary data would be truncated" — que é o desfecho *bom*; o ruim é uma coluna larga o bastante para aceitar em silêncio. Declaração sempre começa com `@`; verifique.
+- **O corpo contém a palavra `select`,** então localizar o `select @p1` final do wrapper precisa usar a *última* ocorrência, não a primeira. `REVERSE` com `CHARINDEX` resolve.
+
+E saiba onde parar: corpo e valores podem conter aspas simples escapadas, então delimitar a lista de valores inteira com `CHARINDEX` produz lixo silencioso nos casos que não encaixam. A divisão de trabalho correta é usar SQL para a *redução de volume* — milhões de linhas com LOB para alguns milhares compactas — e fazer o split final onde exista um parser de verdade.
+
+## Chave de índice tem limite de 900 bytes, e o HASHBYTES mente sobre a largura
+
+Duas chaves naturais nesse tipo de ferramenta passam do limite: caminho de arquivo mais offset, e prefixo de statement mais segmento de valor. A saída é chavear por hash, mas tem um detalhe.
+
+O `HASHBYTES` é tipado como `varbinary(8000)` independente do algoritmo, mesmo que `SHA2_256` sempre devolva 32 bytes. Uma coluna computada sobre ele, portanto, continua estourando a verificação de tamanho de chave. Faça o CAST explícito:
+
+```sql
+ALTER TABLE dbo.exemplo ADD shape_hash AS
+    CAST(HASHBYTES('SHA2_256', ISNULL(a, N'') + N'|' + ISNULL(b, N'')) AS varbinary(32)) PERSISTED;
+```
+
+Note também que no SQL Server 2014 o `HASHBYTES` rejeita entrada acima de 8.000 bytes, então faça o hash de um prefixo limitado em vez de um `nvarchar(max)`.
+
 ## Limites de sintaxe do SQL Server 2014
 
 Encontrados ao escrever isto, todos aplicáveis ao 2014 e ao 2012:

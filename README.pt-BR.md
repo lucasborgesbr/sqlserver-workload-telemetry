@@ -37,6 +37,7 @@ O que generaliza sem ressalva é a lista de modos de falha em [`docs/design-note
 | Estatísticas agregadas | `query_stat_delta` + `query_text` | Delta por intervalo de execuções, CPU, leituras e escritas por `query_hash` — o substituto do Query Store | 5 min | 90 dias |
 | Execuções de job | `job_run`, view `vw_job_run_effective` | Duração real em segundos, status, flag de guard step, e `did_work` | 2 min | 365 dias |
 | Amostragem de requisições ativas | `who_is_active` | Requisições longas, bloqueadas e bloqueantes | 1 min | 30 dias |
+| Valores de parâmetro | `param_sample` | Valores reais de parâmetro por forma de consulta, extraídos dos wrappers de prepared statement e reduzidos a linhas compactas — assim nada precisa varrer a tabela de workload em busca de valores | 1 h | 180 dias |
 
 Mais o `collection_run`, trilha de auditoria de cada execução dos coletores. Essa importa mais do que parece: sem ela, um buraco nos dados é indistinguível de um coletor que morreu em silêncio.
 
@@ -53,9 +54,9 @@ As duas não podem ser unidas por chave: o `xe_workload` não tem `query_hash`. 
 
 A pegada completa na instância, para você saber com o que está concordando antes de rodar o `deploy.sql`:
 
-- **Um banco** (`dba_telemetry` por padrão), `RECOVERY SIMPLE`, com 9 tabelas e 1 view. Nada é criado no `master`, no `msdb` ou nos seus bancos de aplicação.
+- **Um banco** (`dba_telemetry` por padrão), `RECOVERY SIMPLE`, com 10 tabelas e 1 view. Nada é criado no `master`, no `msdb` ou nos seus bancos de aplicação.
 - **Uma event session de escopo de servidor**, `Workload_Capture`, criada parada.
-- **7 stored procedures**, todas no banco de telemetria:
+- **8 stored procedures**, todas no banco de telemetria:
 
 | Procedure | O que faz |
 |---|---|
@@ -65,9 +66,10 @@ A pegada completa na instância, para você saber com o que está concordando an
 | `usp_stamp_job_work` | Materializa o `did_work` nas linhas de job enquanto os eventos de origem ainda existem |
 | `usp_collect_who_is_active` | Roda o `sp_WhoIsActive` numa tabela e remove as sessões que estão vivas mas sem trabalho |
 | `usp_refresh_job_inventory` | Reconstrói o mapa de quais job steps tocam um determinado banco |
+| `usp_collect_param_samples` | Amostra valores reais de parâmetro dos wrappers de prepared statement, reduzindo milhões de linhas com LOB a alguns milhares compactas |
 | `usp_purge_telemetry` | Deletes de retenção em lote |
 
-- **5 jobs do Agent**, com o dono configurado:
+- **6 jobs do Agent**, com o dono configurado:
 
 | Job | Intervalo | Por que esse intervalo |
 |---|---|---|
@@ -75,6 +77,7 @@ A pegada completa na instância, para você saber com o que está concordando an
 | `… - Job Runs` | 2 min | O `sysjobhistory` guarda só ~200 linhas **por job**, então um job frequente pode reter apenas minutos de histórico. Um coletor lento perde execuções em silêncio |
 | `… - Query Stats` | 5 min | O engine agrega esses contadores sozinho, então nada é perdido entre coletas |
 | `… - XE Shred` | 5 min | O file target tem dias de buffer; não há pressa |
+| `… - Param Samples` | 1 h | Cada execução acumula cobertura de formas mais raras, então de hora em hora converge em vez de exigir uma extração única grande |
 | `… - Purge` | diário 04:00 | Retenção, mais o refresh do inventário de jobs |
 
 Esses jobs deliberadamente **não têm guard de réplica**, ao contrário dos jobs de aplicação ao lado dos quais costumam ficar — veja [Em Availability Group](#em-availability-group).
@@ -89,6 +92,7 @@ Aplicada pela `usp_purge_telemetry`, que o job diário chama sem argumentos, ent
 | `who_is_active` | 30 dias | `collection_time` | **local do servidor** |
 | `query_stat_delta` | 90 dias | `collected_at` | UTC |
 | `job_run` | 365 dias | `collected_at` | UTC |
+| `param_sample` | 180 dias | `collected_at` | UTC |
 | `collection_run` | 60 dias | `started_at` | UTC |
 | `query_text`, `capture_residue_archive` | nunca | — | tabelas de dimensão e auditoria, crescimento desprezível |
 
