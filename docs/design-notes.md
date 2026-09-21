@@ -172,6 +172,40 @@ Two traps if you parse it in T-SQL:
 
 And know when to stop: statement bodies and values can both contain escaped single quotes, so fully delimiting the value list with `CHARINDEX` produces silent garbage on the cases it cannot handle. The right division of labour is to use SQL for the *volume reduction* — millions of LOB-bearing rows down to a few thousand compact ones — and do the final split wherever a real parser is available.
 
+## Matching a captured statement back to a query_hash
+
+`xe_workload` has no `query_hash` and `query_stat_delta` has no statement text, so linking a real parameter value to the weight of the template it belongs to means matching on text. Two things make the obvious key wrong, and both fail silently — you get `NULL` where you expected a match, concentrated in a subset of the workload, which reads like sampling noise rather than a defect.
+
+**A fixed-width prefix is not a key.** Take the first N characters of the body as the key and, for any statement shorter than N, the window runs past the closing quote of the body literal and into the value list:
+
+```
+DELETE FROM reading WHERE reading.id = @P1',4104241
+                                          ^^^^^^^^^ value, inside the key
+```
+
+The value changes per execution, so the key changes per execution, so it never matches the stable template. Note the threshold is the width of the *marker you compare with*, not the width of the column: a 400-character prefix compared on its first 120 characters only breaks when the pollution lands inside those 120. That is why long `SELECT`s look fine while short statements fail completely — and short statements are almost exactly the set of `UPDATE`s and `DELETE`s, so the symptom is that the application's whole write path silently has no weight.
+
+Clip at the boundary instead. Finding the real closing quote means skipping doubled quotes, and there is a neat set-based way to do it: replacing `''` with two non-quote characters preserves every offset, so `CHARINDEX` on the masked copy returns a position valid in the original.
+
+```sql
+CHARINDEX(N'''', REPLACE(body COLLATE Latin1_General_BIN2, N'''''', NCHAR(1) + NCHAR(1)))
+```
+
+The `BIN2` collation is not decoration. Under some collations `REPLACE` does not preserve length, which would shift every offset it was supposed to protect.
+
+**The parameter declaration is not stable, so it cannot be part of the key.** A prepared-statement client declares each parameter with the width of the value it is passing *at that moment*:
+
+```
+@P1 varchar(16)     one execution
+@P1 varchar(34)     the next
+```
+
+`query_text` holds whichever width happened to be in the plan cache. Include the declaration in the key and you match only by coincidence. This is easy to misdiagnose as "the workload has enormous template variety": on the instance this was found on, 6,269 `INSERT` samples produced 6,245 apparently distinct shapes.
+
+So match on the body alone — but require that it *begins* the statement, or a short body will match anywhere inside a larger one. `query_text` is inconsistent about whether it stores the `(@P1 int)` declaration prefix, so the body starts either at position 1 or straight after the declaration's closing parenthesis. That parenthesis is findable without balancing anything: it is the first `)` followed by a letter, since the ones inside `varchar(16)` are followed by `,` or `)`.
+
+**Then refuse to guess.** The first few hundred characters of a machine-generated `SELECT` are mostly column list, shared across many statements that differ only in their `WHERE` clause — measured worst case here, one 400-character prefix matched 183 different statements. Any tie-break picks one, and a plausible wrong weight is worse than an honest `NULL`. Accept only a unique candidate and leave the rest unmatched; the ambiguous fraction shrinks as the prefix widens, so it is a knob, not a wall.
+
 ## Index keys have a 900-byte limit, and HASHBYTES lies about its width
 
 Two natural keys in this kind of tooling exceed the limit: a file path plus offset, and a statement prefix plus value segment. The fix is to key on a hash instead, but there is a catch.
@@ -184,6 +218,8 @@ ALTER TABLE dbo.example ADD shape_hash AS
 ```
 
 Note also that on SQL Server 2014 `HASHBYTES` rejects inputs over 8,000 bytes, so hash a bounded prefix rather than an `nvarchar(max)`.
+
+The same class of surprise applies to `SUBSTRING`: over an `nvarchar(max)` input it returns `nvarchar(max)`, however few characters you asked for. Select 60 characters into a temp table and index them and you get *"Column is of a type that is invalid for use as a key column in an index"*. Cast the result to the width you actually want.
 
 ## SQL Server 2014 syntax limits
 

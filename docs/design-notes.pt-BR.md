@@ -172,6 +172,40 @@ Duas armadilhas ao parsear em T-SQL:
 
 E saiba onde parar: corpo e valores podem conter aspas simples escapadas, então delimitar a lista de valores inteira com `CHARINDEX` produz lixo silencioso nos casos que não encaixam. A divisão de trabalho correta é usar SQL para a *redução de volume* — milhões de linhas com LOB para alguns milhares compactas — e fazer o split final onde exista um parser de verdade.
 
+## Casar um statement capturado de volta com um query_hash
+
+O `xe_workload` não tem `query_hash` e o `query_stat_delta` não tem texto, então ligar um valor real de parâmetro ao peso do template a que ele pertence exige casamento por texto. Duas coisas tornam a chave óbvia errada, e as duas falham em silêncio — você obtém `NULL` onde esperava casamento, concentrado num subconjunto da carga, o que se parece com ruído de amostragem e não com defeito.
+
+**Prefixo de largura fixa não é chave.** Se você pega os primeiros N caracteres do corpo como chave, para qualquer statement menor que N a janela passa do fechamento do literal do corpo e entra na lista de valores:
+
+```
+DELETE FROM reading WHERE reading.id = @P1',4104241
+                                          ^^^^^^^^^ valor, dentro da chave
+```
+
+O valor muda a cada execução, então a chave muda a cada execução, então ela nunca casa com o template estável. O limiar é a largura do *marcador com que você compara*, não a largura da coluna: um prefixo de 400 caracteres comparado pelos seus primeiros 120 só quebra quando a contaminação cai dentro desses 120. É por isso que `SELECT`s longos parecem sadios enquanto statements curtos falham por completo — e statements curtos são quase exatamente o conjunto dos `UPDATE` e `DELETE`, de modo que o sintoma é o caminho de escrita inteiro da aplicação ficar silenciosamente sem peso.
+
+Corte na fronteira. Achar o fechamento real exige pular quotes duplicadas, e há um jeito elegante e set-based: substituir `''` por dois caracteres que não são quote preserva todos os deslocamentos, então `CHARINDEX` sobre a cópia mascarada devolve uma posição válida no original.
+
+```sql
+CHARINDEX(N'''', REPLACE(corpo COLLATE Latin1_General_BIN2, N'''''', NCHAR(1) + NCHAR(1)))
+```
+
+A collation `BIN2` não é enfeite. Em algumas collations o `REPLACE` não preserva comprimento, o que deslocaria justamente os offsets que ele deveria proteger.
+
+**A declaração de parâmetros não é estável, então não pode fazer parte da chave.** Um cliente de prepared statement declara cada parâmetro com a largura do valor que está passando *naquele momento*:
+
+```
+@P1 varchar(16)     numa execução
+@P1 varchar(34)     na seguinte
+```
+
+O `query_text` guarda a largura que por acaso estava no plan cache. Se a declaração entra na chave, o casamento acontece por coincidência. Isso é fácil de diagnosticar errado como "a carga tem variedade enorme de templates": na instância onde isto foi encontrado, 6.269 amostras de `INSERT` produziram 6.245 formas aparentemente distintas.
+
+Então case pelo corpo apenas — mas exija que ele *comece* o statement, senão um corpo curto casa em qualquer lugar dentro de um maior. O `query_text` é inconsistente sobre guardar ou não o prefixo de declaração `(@P1 int)`, então o corpo começa na posição 1 ou logo após o parêntese que fecha a declaração. Esse parêntese é localizável sem balancear nada: é o primeiro `)` seguido de letra, já que os de dentro de `varchar(16)` são seguidos de `,` ou `)`.
+
+**E então recuse-se a adivinhar.** As primeiras centenas de caracteres de um `SELECT` gerado por ORM são quase só lista de colunas, compartilhada por muitos statements que diferem apenas no `WHERE` — pior caso medido aqui, um prefixo de 400 caracteres casou com 183 statements diferentes. Qualquer critério de desempate escolhe um, e um peso plausível mas errado é pior que um `NULL` honesto. Aceite somente candidato único e deixe o resto sem casar; a fração ambígua diminui conforme o prefixo aumenta, então é um botão de ajuste, não uma parede.
+
 ## Chave de índice tem limite de 900 bytes, e o HASHBYTES mente sobre a largura
 
 Duas chaves naturais nesse tipo de ferramenta passam do limite: caminho de arquivo mais offset, e prefixo de statement mais segmento de valor. A saída é chavear por hash, mas tem um detalhe.
@@ -184,6 +218,8 @@ ALTER TABLE dbo.exemplo ADD shape_hash AS
 ```
 
 Note também que no SQL Server 2014 o `HASHBYTES` rejeita entrada acima de 8.000 bytes, então faça o hash de um prefixo limitado em vez de um `nvarchar(max)`.
+
+A mesma classe de surpresa vale para o `SUBSTRING`: sobre uma entrada `nvarchar(max)` ele devolve `nvarchar(max)`, não importa quantos caracteres você pediu. Selecione 60 caracteres numa tabela temporária, tente indexar, e você recebe *"Column is of a type that is invalid for use as a key column in an index"*. Faça `CAST` para a largura que você realmente quer.
 
 ## Limites de sintaxe do SQL Server 2014
 

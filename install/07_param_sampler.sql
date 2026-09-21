@@ -46,8 +46,8 @@ CREATE TABLE dbo.param_sample (
     client_app_name nvarchar(256)  NULL,
     query_hash      binary(8)      NULL,   -- matched to query_text where possible
     param_decl      nvarchar(2000) NULL,   -- '@P1 varchar(16),@P2 int'
-    stmt_prefix     nvarchar(400)  NULL,   -- start of the body, used for matching
-    value_segment   nvarchar(1000) NULL,   -- segment containing the values
+    stmt_prefix     nvarchar(400)  NULL,   -- body, clipped at 400 or at the boundary
+    value_segment   nvarchar(1000) NULL,   -- from the boundary forward: the values
     event_time_utc  datetime2(3)   NULL,
     duration_us     bigint         NULL,
     row_count       bigint         NULL,
@@ -101,7 +101,8 @@ BEGIN
         SELECT
             r.event_id, r.event_time_utc, r.db_name, r.client_app_name,
             r.duration_us, r.row_count,
-            a.anchor, h.has_decl, d1.decl_open, d2.decl_close, s1.stmt_open, e.tail_end
+            a.anchor, h.has_decl, d1.decl_open, d2.decl_close, s1.stmt_open,
+            e.tail_end, c.rel_close
         INTO #pos
         FROM (
             SELECT TOP (@max_rows_read)
@@ -139,7 +140,25 @@ BEGIN
                                  THEN DATALENGTH(r.t)/2
                                       - CHARINDEX(REVERSE('select @p1'), REVERSE(r.t))
                                       - 9
-                                 ELSE DATALENGTH(r.t)/2 END AS tail_end) e;
+                                 ELSE DATALENGTH(r.t)/2 END AS tail_end) e
+        /* --- the boundary between the SQL body and the value list ----------
+           Everything below depends on knowing where the body literal closes.
+           A fixed-width prefix cannot be used as a matching key: for a body
+           shorter than the window, the window runs past the closing quote and
+           swallows a parameter value, so the key changes on every execution
+           and never matches query_text. Measured on this workload: every
+           UPDATE and DELETE body is under 120 characters, which is the width
+           the matching marker uses, so 100% of them failed to match.
+
+           Finding the real closing quote means skipping doubled quotes.
+           Replacing '' with two non-quote characters preserves every offset,
+           so CHARINDEX on the masked copy returns a position valid in the
+           original string. BIN2 is required: under some collations REPLACE
+           does not preserve length, which would shift every offset. */
+        CROSS APPLY (SELECT SUBSTRING(r.t, s1.stmt_open + 2, 4000) AS body_region) b
+        CROSS APPLY (SELECT CHARINDEX(N'''',
+                               REPLACE(b.body_region COLLATE Latin1_General_BIN2,
+                                       N'''''', NCHAR(1) + NCHAR(1))) AS rel_close) c;
 
         SELECT p.event_id, p.event_time_utc, p.db_name, p.client_app_name,
                p.duration_us, p.row_count,
@@ -147,6 +166,7 @@ BEGIN
                     WHEN p.stmt_open = 0 THEN 'no_stmt'
                     WHEN p.has_decl  = 0 THEN 'ok_no_params'
                     WHEN p.decl_close = 0 THEN 'no_decl'
+                    WHEN p.rel_close  = 0 THEN 'ok_no_bound'
                     ELSE 'ok' END AS parse_status,
                /* Defensive LEFT(): if the parse misjudges a boundary the row
                   is stored with a clipped declaration instead of failing the
@@ -155,10 +175,27 @@ BEGIN
                     THEN LEFT(SUBSTRING(w.st, p.decl_open + 2,
                                         p.decl_close - p.decl_open - 2), 2000)
                END AS param_decl,
+               /* The body, clipped at 400 characters OR at the boundary,
+                  whichever comes first. Clipping at the boundary is what makes
+                  this a stable key for short statements. */
                CASE WHEN p.stmt_open > 0
-                    THEN SUBSTRING(w.st, p.stmt_open + 2, 400)
+                    THEN SUBSTRING(w.st, p.stmt_open + 2,
+                                   CASE WHEN p.rel_close > 1 AND p.rel_close - 1 < 400
+                                        THEN p.rel_close - 1 ELSE 400 END)
                END AS stmt_prefix,
-               CASE WHEN p.tail_end > 0
+               /* From the boundary forward, so the segment starts where the
+                  values start instead of wherever a fixed window happened to
+                  land. 1,000 characters covers 99.7% of value lists here
+                  (measured: mean 20, max 2,560). */
+               CASE WHEN p.rel_close > 0
+                     AND p.tail_end > p.stmt_open + p.rel_close + 1
+                    THEN SUBSTRING(w.st, p.stmt_open + p.rel_close + 2,
+                                   CASE WHEN p.tail_end - (p.stmt_open + p.rel_close + 1) > 1000
+                                        THEN 1000
+                                        ELSE p.tail_end - (p.stmt_open + p.rel_close + 1) END)
+                    /* Boundary not found: fall back to the trailing window, so
+                       a parse miss degrades to noisy-but-present, not NULL. */
+                    WHEN p.tail_end > 0
                     THEN SUBSTRING(w.st,
                                    CASE WHEN p.tail_end > 1000 THEN p.tail_end - 1000 ELSE 1 END,
                                    CASE WHEN p.tail_end > 1000 THEN 1000 ELSE p.tail_end END)
@@ -179,7 +216,7 @@ BEGIN
                    DENSE_RANK()  OVER (PARTITION BY x.stmt_prefix
                                        ORDER BY x.value_segment)  AS val_rank
             FROM #parsed x
-            WHERE x.parse_status IN ('ok', 'ok_no_params')
+            WHERE x.parse_status LIKE 'ok%'
         ) y
         WHERE y.dup_rn = 1 AND y.val_rank <= @samples_per_shape;
 
@@ -193,19 +230,77 @@ BEGIN
         INTO #shapes
         FROM #sampled s;
 
+        /* Materialize the dimension once, and precompute where the statement
+           actually begins. query_text stores some statements with a leading
+           '(@P1 int,...)' declaration and some without, so the body does not
+           start at a fixed position. The declaration's closing parenthesis is
+           the first ')' followed by a letter: inner ones, from 'varchar(16)',
+           are followed by ',' or ')'.
+
+           body_head then gives pass 3b an equality predicate to join on, so
+           the expensive full-prefix comparison only runs against real
+           candidates. Without it, every unmatched shape scanned all of
+           query_text and the run took 54s instead of 11s. */
+        SELECT qt.query_hash, qt.last_seen, q.qtext, bs.body_start,
+               CAST(SUBSTRING(q.qtext, bs.body_start, 60) AS nvarchar(60)) AS body_head
+        INTO #qt
+        FROM dbo.query_text qt
+        CROSS APPLY (SELECT CONVERT(nvarchar(max), qt.query_text) AS qtext) q
+        CROSS APPLY (SELECT CASE WHEN LEFT(q.qtext, 2) = N'(@'
+                                  AND PATINDEX(N'%)[A-Za-z]%', q.qtext) > 0
+                                 THEN PATINDEX(N'%)[A-Za-z]%', q.qtext) + 1
+                                 ELSE 1 END AS body_start) bs
+        WHERE qt.db_name = @db;
+
+        CREATE NONCLUSTERED INDEX ix_qt_head ON #qt (body_head);
+
         SELECT sh.param_decl, sh.stmt_prefix, m.query_hash
         INTO #shape_hash
         FROM #shapes sh
         OUTER APPLY (
             SELECT TOP 1 qt.query_hash
-            FROM dbo.query_text qt
+            FROM #qt qt
             CROSS APPLY (SELECT N'(' + sh.param_decl + N')'
                               + LEFT(sh.stmt_prefix, 120) AS marker) mk
-            WHERE qt.db_name = @db
-              AND LEFT(CONVERT(nvarchar(4000), qt.query_text),
-                       DATALENGTH(mk.marker) / 2) = mk.marker
-            ORDER BY qt.last_seen DESC
+            WHERE LEFT(qt.qtext, DATALENGTH(mk.marker) / 2) = mk.marker
+            /* A boundary-clipped prefix can be the entire statement, and a
+               prefix match would then also accept any longer statement that
+               starts the same way. Prefer the exact-length candidate. */
+            ORDER BY CASE WHEN DATALENGTH(qt.qtext)
+                               = DATALENGTH(mk.marker) THEN 0 ELSE 1 END,
+                     qt.last_seen DESC
         ) m;
+
+        /* --- 3b. second pass, declaration-independent --------------------
+           The client declares each parameter with the width of the value it
+           happens to be passing, so the SAME statement arrives as
+           '@P1 varchar(16)' on one execution and '@P1 varchar(34)' on the
+           next. Any key containing param_decl is therefore unstable by
+           construction, and pass 3 misses every shape whose cached
+           declaration was recorded at a different width. Measured here: it
+           missed 7 of 11 UPDATE shapes and 3 of 6 DELETE shapes.
+
+           So match on the body alone. The body must BEGIN the statement, which
+           accepts both query_text spellings and rejects a body that merely
+           occurs inside some larger statement.
+
+           Only a UNIQUE candidate is accepted. A prefix of a verbose
+           SQLAlchemy SELECT is mostly column list and can prefix up to 183
+           different statements; binding one of those by a tie-break would
+           put a plausible but wrong weight on the shape. An ambiguous shape
+           is left NULL, which is honest and visible, and narrows as
+           stmt_prefix widens. */
+        UPDATE sh
+           SET query_hash = m.query_hash
+        FROM #shape_hash sh
+        CROSS APPLY (
+            SELECT CASE WHEN COUNT(DISTINCT qt.query_hash) = 1
+                        THEN MIN(qt.query_hash) END AS query_hash
+            FROM #qt qt
+            WHERE qt.body_head = CAST(SUBSTRING(sh.stmt_prefix, 1, 60) AS nvarchar(60))
+              AND CHARINDEX(sh.stmt_prefix, qt.qtext) = qt.body_start
+        ) m
+        WHERE sh.query_hash IS NULL;
 
         /* --- 4. store what is not already present ------------------------ */
         INSERT INTO dbo.param_sample
