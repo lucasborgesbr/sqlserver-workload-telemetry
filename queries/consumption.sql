@@ -262,11 +262,18 @@ ORDER BY SUM(a.total_pages) DESC;
 
    value_segment is the raw slice that CONTAINS the values, not one value per
    column — see install/07 for why that split is left to the consumer.
+
+   body_hash IS NOT NULL is not optional. Rows without it were collected
+   before the sampler keyed on the whole body, and were matched by text
+   prefix; on an ORM workload that binds values to the WRONG statement rather
+   than leaving them unmatched. Grouping by body_hash rather than by
+   stmt_prefix matters for the same reason — the prefix is not an identifier.
    --------------------------------------------------------------------------- */
 SELECT TOP 50
        w.executions,
        ps.param_decl,
        COUNT(*)                                    AS distinct_values_sampled,
+       MIN(ps.body_len)                            AS body_len,
        MIN(ps.event_time_utc)                      AS first_seen,
        MAX(ps.event_time_utc)                      AS last_seen,
        CONVERT(nvarchar(160), MIN(ps.stmt_prefix)) AS body_prefix
@@ -278,8 +285,31 @@ JOIN (
       AND counter_reset = 0
     GROUP BY query_hash
 ) w ON w.query_hash = ps.query_hash
-GROUP BY w.executions, ps.param_decl
+WHERE ps.body_hash IS NOT NULL
+GROUP BY w.executions, ps.body_hash, ps.param_decl
 ORDER BY w.executions DESC;
+
+
+/* ---------------------------------------------------------------------------
+   11c. Audit the attribution instead of trusting it.
+
+   Every body should resolve to exactly one query_hash. Anything above 1 means
+   two templates are colliding on the key, which on this design can only
+   happen when query_text holds a TRUNCATED statement — a body captured at the
+   old 4,000-character cap hashes as a prefix of the real one. The fix is to
+   finish the text recapture, not to change the key.
+   --------------------------------------------------------------------------- */
+SELECT hashes_per_body,
+       COUNT(*) AS bodies
+FROM (
+    SELECT body_hash, COUNT(DISTINCT query_hash) AS hashes_per_body
+    FROM dbo.param_sample
+    WHERE body_hash IS NOT NULL
+      AND query_hash IS NOT NULL
+    GROUP BY body_hash
+) z
+GROUP BY hashes_per_body
+ORDER BY hashes_per_body;
 
 
 /* ---------------------------------------------------------------------------
@@ -291,7 +321,7 @@ ORDER BY w.executions DESC;
    --------------------------------------------------------------------------- */
 SELECT parse_status,
        COUNT(*)                                                   AS samples,
-       COUNT(DISTINCT stmt_prefix)                                AS distinct_shapes,
+       COUNT(DISTINCT body_hash)                                  AS distinct_shapes,
        SUM(CASE WHEN query_hash IS NOT NULL THEN 1 ELSE 0 END)    AS matched_to_template,
        CAST(100.0 * SUM(CASE WHEN query_hash IS NOT NULL THEN 1 ELSE 0 END)
             / NULLIF(COUNT(*), 0) AS decimal(5,1))                AS pct_matched

@@ -37,7 +37,7 @@ What generalises without qualification is the list of failure modes in [`docs/de
 | Aggregated query stats | `query_stat_delta` + `query_text` | Per-interval delta of executions, CPU, reads and writes by `query_hash` — the Query Store substitute | 5 min | 90 days |
 | Job executions | `job_run`, view `vw_job_run_effective` | Real duration in seconds, status, guard-step flag, and `did_work` | 2 min | 365 days |
 | Active request sampling | `who_is_active` | Long-running, blocked and blocking requests | 1 min | 30 days |
-| Parameter values | `param_sample` | Real parameter values per query shape, pulled out of prepared-statement wrappers and reduced to compact rows — so nothing ever has to scan the workload table looking for values | 1 h | 180 days |
+| Parameter values | `param_sample` | Real parameter values per query shape, pulled out of prepared-statement wrappers and reduced to compact rows — so nothing ever has to scan the workload table looking for values. Linked to its template by `body_hash`, a hash of the whole statement body | 1 h | 180 days |
 
 Plus `collection_run`, an audit trail of every collector execution. That one matters more than it looks: without it, a gap in the data is indistinguishable from a collector that quietly died.
 
@@ -45,8 +45,9 @@ Plus `collection_run`, an audit trail of every collector execution. That one mat
 
 - `query_stat_delta` + `query_text` → *what matters, what it costs, and the query's shape.* Weight comes from `delta_executions`; shape from `query_text`, which holds the complete parameterized statement with its parameter declaration prefix, e.g. `(@P1 varchar(16))SELECT ...`. Filter `counter_reset = 0` when summing — see the design notes for why.
 - `xe_workload` → *the full statement as executed, with real parameter values.* This is the only source of actual values, and the only place to see what a client sent rather than what the engine cached.
+- `param_sample` → *real parameter values, joinable to a weight.* Join it to `query_text` on `body_hash`, and from there to `query_stat_delta` on `query_hash`. **Filter `body_hash IS NOT NULL`** in anything that trusts the attribution: rows collected before that column existed were matched by text prefix, and on an ORM workload a prefix match is not merely incomplete — it binds values to the wrong statement. See the [migration](migrations/2026-09-22-match-by-body-hash.sql).
 
-The two cannot be joined on a key: `xe_workload` has no `query_hash`. Linking a weighted template to real parameter values means matching on normalised text. That is a deliberate consequence of the granularity split described below, not an oversight.
+`xe_workload` itself has no `query_hash`, so it cannot be joined to the weights directly; that is a deliberate consequence of the granularity split described below, not an oversight. `param_sample` exists to bridge exactly that gap.
 
 **They also see different things.** `query_stat_delta` records statements *inside* procedures and functions; `xe_workload` records only the *outer* call. A procedure invoked by a job appears in the former as one row per internal statement, and in the latter as a single batch whose text is just the `EXEC`. Searching `xe_workload` for a procedure's internal SQL returns nothing, and that is correct behaviour.
 
@@ -56,7 +57,7 @@ The full footprint on the instance, so you know what you are agreeing to before 
 
 - **One database** (`dba_telemetry` by default), `RECOVERY SIMPLE`, holding 10 tables and 1 view. Nothing is created in `master`, `msdb` or your application databases.
 - **One server-scoped event session**, `Workload_Capture`, created stopped.
-- **8 stored procedures**, all in the telemetry database:
+- **8 stored procedures and 1 inline function** (`fn_body_hash`, the single definition of the sample-to-template key), all in the telemetry database:
 
 | Procedure | What it does |
 |---|---|

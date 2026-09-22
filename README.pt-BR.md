@@ -37,7 +37,7 @@ O que generaliza sem ressalva é a lista de modos de falha em [`docs/design-note
 | Estatísticas agregadas | `query_stat_delta` + `query_text` | Delta por intervalo de execuções, CPU, leituras e escritas por `query_hash` — o substituto do Query Store | 5 min | 90 dias |
 | Execuções de job | `job_run`, view `vw_job_run_effective` | Duração real em segundos, status, flag de guard step, e `did_work` | 2 min | 365 dias |
 | Amostragem de requisições ativas | `who_is_active` | Requisições longas, bloqueadas e bloqueantes | 1 min | 30 dias |
-| Valores de parâmetro | `param_sample` | Valores reais de parâmetro por forma de consulta, extraídos dos wrappers de prepared statement e reduzidos a linhas compactas — assim nada precisa varrer a tabela de workload em busca de valores | 1 h | 180 dias |
+| Valores de parâmetro | `param_sample` | Valores reais de parâmetro por forma de consulta, extraídos dos wrappers de prepared statement e reduzidos a linhas compactas — assim nada precisa varrer a tabela de workload em busca de valores. Ligado ao seu template pelo `body_hash`, um hash do corpo inteiro do statement | 1 h | 180 dias |
 
 Mais o `collection_run`, trilha de auditoria de cada execução dos coletores. Essa importa mais do que parece: sem ela, um buraco nos dados é indistinguível de um coletor que morreu em silêncio.
 
@@ -46,7 +46,9 @@ Mais o `collection_run`, trilha de auditoria de cada execução dos coletores. E
 - `query_stat_delta` + `query_text` → *o que importa, quanto custa, e a forma da consulta.* O peso vem de `delta_executions`; a forma vem do `query_text`, que guarda o statement parametrizado completo com o prefixo de declaração de parâmetros, por exemplo `(@P1 varchar(16))SELECT ...`. Filtre `counter_reset = 0` ao somar — as notas de desenho explicam por quê.
 - `xe_workload` → *o statement como foi executado, com os valores reais de parâmetro.* É a única fonte de valores de verdade, e o único lugar onde se vê o que o cliente enviou em vez do que o engine cacheou.
 
-As duas não podem ser unidas por chave: o `xe_workload` não tem `query_hash`. Ligar um template ponderado a valores reais de parâmetro exige casamento por texto normalizado. Isso é consequência deliberada da divisão de granularidade descrita abaixo, não descuido.
+- `param_sample` → *valores reais de parâmetro, uníveis a um peso.* Junte com `query_text` pelo `body_hash`, e de lá com `query_stat_delta` pelo `query_hash`. **Filtre `body_hash IS NOT NULL`** em qualquer coisa que confie na atribuição: linhas coletadas antes dessa coluna existir foram casadas por prefixo de texto, e numa carga gerada por ORM o casamento por prefixo não é apenas incompleto — ele liga valores ao statement errado. Veja a [migração](migrations/2026-09-22-match-by-body-hash.sql).
+
+O `xe_workload` em si não tem `query_hash`, então não pode ser unido aos pesos diretamente; isso é consequência deliberada da divisão de granularidade descrita abaixo, não descuido. O `param_sample` existe justamente para fazer essa ponte.
 
 **E elas enxergam coisas diferentes.** O `query_stat_delta` registra statements *dentro* de procedures e funções; o `xe_workload` registra apenas a *chamada externa*. Uma procedure invocada por um job aparece na primeira como uma linha por statement interno, e na segunda como um único batch cujo texto é só o `EXEC`. Procurar no `xe_workload` o SQL interno de uma procedure devolve nada, e isso é comportamento correto.
 
@@ -56,7 +58,7 @@ A pegada completa na instância, para você saber com o que está concordando an
 
 - **Um banco** (`dba_telemetry` por padrão), `RECOVERY SIMPLE`, com 10 tabelas e 1 view. Nada é criado no `master`, no `msdb` ou nos seus bancos de aplicação.
 - **Uma event session de escopo de servidor**, `Workload_Capture`, criada parada.
-- **8 stored procedures**, todas no banco de telemetria:
+- **8 stored procedures e 1 função inline** (`fn_body_hash`, a definição única da chave que liga amostra a template), todas no banco de telemetria:
 
 | Procedure | O que faz |
 |---|---|

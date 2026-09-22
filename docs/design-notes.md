@@ -204,7 +204,18 @@ The `BIN2` collation is not decoration. Under some collations `REPLACE` does not
 
 So match on the body alone — but require that it *begins* the statement, or a short body will match anywhere inside a larger one. `query_text` is inconsistent about whether it stores the `(@P1 int)` declaration prefix, so the body starts either at position 1 or straight after the declaration's closing parenthesis. That parenthesis is findable without balancing anything: it is the first `)` followed by a letter, since the ones inside `varchar(16)` are followed by `,` or `)`.
 
-**Then refuse to guess.** The first few hundred characters of a machine-generated `SELECT` are mostly column list, shared across many statements that differ only in their `WHERE` clause — measured worst case here, one 400-character prefix matched 183 different statements. Any tie-break picks one, and a plausible wrong weight is worse than an honest `NULL`. Accept only a unique candidate and leave the rest unmatched; the ambiguous fraction shrinks as the prefix widens, so it is a knob, not a wall.
+**Then refuse to guess.** The first few hundred characters of a machine-generated `SELECT` are mostly column list, shared across many statements that differ only in their `WHERE` clause — measured worst case here, one 400-character prefix matched 192 different statements. Any tie-break picks one, and a plausible wrong weight is worse than an honest `NULL`. Accept only a unique candidate and leave the rest unmatched.
+
+**And do not match on a prefix at all.** The paragraph above was the intermediate conclusion, and it is not good enough. Widening the prefix moves the collision rather than removing it: on this workload 89% of bodies over 400 characters collided at 400, and 71% of bodies over 4,000 still collided at 4,000. Those statements are genuinely identical until the `JOIN` or the `WHERE`, so no prefix width separates them.
+
+What makes this worth spelling out is the failure mode. A prefix match that *fails* yields `NULL`, which anyone can count. A prefix match that *succeeds against the wrong statement* yields a confident, plausible `query_hash`, and nothing downstream can tell. Measured before the fix: the single most-executed query in the workload had its samples spread across 20 different `query_hash` values, of which 3 were right. Anyone reading values for one of the other 19 would have gotten real parameter values belonging to a different query.
+
+So key on a hash of the **entire normalized body**, computed identically on both sides — one definition, in one function, because two inlined copies of a normalization expression will drift and nothing will match. Two details on SQL Server 2014:
+
+- `HASHBYTES` rejects input over 8,000 bytes, which is only 4,000 `nvarchar` characters. Real bodies here reach 9,020. Hash in 4,000-character chunks and hash the chunk hashes together; `SUBSTRING` past the end returns an empty string, not `NULL`, so short bodies stay deterministic.
+- The usual `'<>'` placeholder trick for collapsing whitespace runs is unsafe on SQL text, because `<>` is an operator that occurs in real statements. Use control characters.
+
+Keep the prefix column — it is what makes the table readable by a human — but record the full body length next to it so nobody mistakes a truncated prefix for an identifier.
 
 ## Index keys have a 900-byte limit, and HASHBYTES lies about its width
 

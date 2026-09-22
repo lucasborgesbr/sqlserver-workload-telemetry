@@ -204,7 +204,18 @@ O `query_text` guarda a largura que por acaso estava no plan cache. Se a declara
 
 Então case pelo corpo apenas — mas exija que ele *comece* o statement, senão um corpo curto casa em qualquer lugar dentro de um maior. O `query_text` é inconsistente sobre guardar ou não o prefixo de declaração `(@P1 int)`, então o corpo começa na posição 1 ou logo após o parêntese que fecha a declaração. Esse parêntese é localizável sem balancear nada: é o primeiro `)` seguido de letra, já que os de dentro de `varchar(16)` são seguidos de `,` ou `)`.
 
-**E então recuse-se a adivinhar.** As primeiras centenas de caracteres de um `SELECT` gerado por ORM são quase só lista de colunas, compartilhada por muitos statements que diferem apenas no `WHERE` — pior caso medido aqui, um prefixo de 400 caracteres casou com 183 statements diferentes. Qualquer critério de desempate escolhe um, e um peso plausível mas errado é pior que um `NULL` honesto. Aceite somente candidato único e deixe o resto sem casar; a fração ambígua diminui conforme o prefixo aumenta, então é um botão de ajuste, não uma parede.
+**E então recuse-se a adivinhar.** As primeiras centenas de caracteres de um `SELECT` gerado por ORM são quase só lista de colunas, compartilhada por muitos statements que diferem apenas no `WHERE` — pior caso medido aqui, um prefixo de 400 caracteres casou com 192 statements diferentes. Qualquer critério de desempate escolhe um, e um peso plausível mas errado é pior que um `NULL` honesto. Aceite somente candidato único e deixe o resto sem casar.
+
+**E não case por prefixo, ponto.** O parágrafo acima era a conclusão intermediária, e não é suficiente. Alargar o prefixo move a colisão em vez de eliminá-la: nesta carga, 89% dos corpos acima de 400 caracteres colidiam em 400, e 71% dos corpos acima de 4.000 ainda colidiam em 4.000. Esses statements são genuinamente idênticos até o `JOIN` ou o `WHERE`, então nenhuma largura de prefixo os separa.
+
+O que torna isso digno de registro é o modo de falha. Um casamento por prefixo que *falha* devolve `NULL`, que qualquer um consegue contar. Um casamento por prefixo que *acerta o statement errado* devolve um `query_hash` confiante e plausível, e nada a jusante percebe. Medido antes da correção: a consulta mais executada de toda a carga teve suas amostras espalhadas por 20 `query_hash` diferentes, dos quais 3 estavam certos. Quem lesse os valores de um dos outros 19 receberia valores reais de parâmetro pertencentes a outra consulta.
+
+Então use como chave o hash do **corpo inteiro normalizado**, calculado de forma idêntica nos dois lados — uma definição, numa função, porque duas cópias inline de uma expressão de normalização vão divergir e nada vai casar. Dois detalhes no SQL Server 2014:
+
+- O `HASHBYTES` rejeita entrada acima de 8.000 bytes, que são apenas 4.000 caracteres `nvarchar`. Corpos reais aqui chegam a 9.020. Faça o hash em blocos de 4.000 caracteres e o hash dos hashes dos blocos; `SUBSTRING` além do fim devolve string vazia, não `NULL`, então corpos curtos continuam determinísticos.
+- O truque usual do placeholder `'<>'` para colapsar sequências de espaço é inseguro em texto SQL, porque `<>` é um operador que aparece em statements reais. Use caracteres de controle.
+
+Mantenha a coluna de prefixo — é o que torna a tabela legível por um humano — mas registre ao lado o comprimento total do corpo, para que ninguém confunda um prefixo truncado com um identificador.
 
 ## Chave de índice tem limite de 900 bytes, e o HASHBYTES mente sobre a largura
 
