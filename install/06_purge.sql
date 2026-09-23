@@ -62,6 +62,22 @@ BEGIN
             END
         END
 
+        /* The local-to-UTC mapping follows the samples it describes. Keyed off
+           the samples rather than off a date, so the two can never disagree:
+           a mapping row survives exactly as long as a sample references it. */
+        IF OBJECT_ID('dbo.wia_collection') IS NOT NULL
+        BEGIN
+            SET @n = 1;
+            WHILE @n > 0
+            BEGIN
+                DELETE TOP (@batch_size) c
+                FROM dbo.wia_collection c
+                WHERE NOT EXISTS (SELECT 1 FROM dbo.who_is_active w
+                                   WHERE w.collection_time = c.collection_time);
+                SET @n = @@ROWCOUNT; SET @deleted += @n;
+            END
+        END
+
         SET @n = 1;
         WHILE @n > 0
         BEGIN

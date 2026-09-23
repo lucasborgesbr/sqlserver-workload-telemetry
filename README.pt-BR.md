@@ -36,7 +36,7 @@ O que generaliza sem ressalva é a lista de modos de falha em [`docs/design-note
 | Workload cru | `xe_workload` | Cada batch e RPC: texto completo do statement **com valores de parâmetro**, duração, CPU, leituras lógicas e físicas, escritas de I/O, contagem de linhas, app, host, login, sessão, e o job step de origem | 5 min | 30 dias |
 | Estatísticas agregadas | `query_stat_delta` + `query_text` | Delta por intervalo de execuções, CPU, leituras e escritas por `query_hash` — o substituto do Query Store | 5 min | 90 dias |
 | Execuções de job | `job_run`, view `vw_job_run_effective` | Duração real em segundos, status, flag de guard step, e `did_work` | 2 min | 365 dias |
-| Amostragem de requisições ativas | `who_is_active` | Requisições longas, bloqueadas e bloqueantes | 1 min | 30 dias |
+| Amostragem de requisições ativas | `who_is_active`, view `vw_who_is_active` | Requisições longas, bloqueadas e bloqueantes. Leia pela view: o `sp_WhoIsActive` grava o timestamp em hora **local do servidor**, e a view acrescenta o equivalente em UTC | 1 min | 30 dias |
 | Valores de parâmetro | `param_sample` | Valores reais de parâmetro por forma de consulta, extraídos dos wrappers de prepared statement e reduzidos a linhas compactas — assim nada precisa varrer a tabela de workload em busca de valores. Ligado ao seu template pelo `body_hash`, um hash do corpo inteiro do statement | 1 h | 180 dias |
 
 Mais o `collection_run`, trilha de auditoria de cada execução dos coletores. Essa importa mais do que parece: sem ela, um buraco nos dados é indistinguível de um coletor que morreu em silêncio.
@@ -56,7 +56,7 @@ O `xe_workload` em si não tem `query_hash`, então não pode ser unido aos peso
 
 A pegada completa na instância, para você saber com o que está concordando antes de rodar o `deploy.sql`:
 
-- **Um banco** (`dba_telemetry` por padrão), `RECOVERY SIMPLE`, com 10 tabelas e 1 view. Nada é criado no `master`, no `msdb` ou nos seus bancos de aplicação.
+- **Um banco** (`dba_telemetry` por padrão), `RECOVERY SIMPLE`, com 12 tabelas e 3 views. Nada é criado no `master`, no `msdb` ou nos seus bancos de aplicação.
 - **Uma event session de escopo de servidor**, `Workload_Capture`, criada parada.
 - **8 stored procedures e 1 função inline** (`fn_body_hash`, a definição única da chave que liga amostra a template), todas no banco de telemetria:
 
@@ -92,6 +92,7 @@ Aplicada pela `usp_purge_telemetry`, que o job diário chama sem argumentos, ent
 |---|---|---|---|
 | `xe_workload` | 30 dias | `event_time_utc` | UTC |
 | `who_is_active` | 30 dias | `collection_time` | **local do servidor** |
+| `wia_collection` | acompanha o `who_is_active` | — | o mapa local→UTC; a linha vive enquanto uma amostra a referenciar |
 | `query_stat_delta` | 90 dias | `collected_at` | UTC |
 | `job_run` | 365 dias | `collected_at` | UTC |
 | `param_sample` | 180 dias | `collected_at` | UTC |

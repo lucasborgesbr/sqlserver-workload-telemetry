@@ -4,6 +4,9 @@
    Time zone matters here and is easy to get wrong:
      event_time_utc, collected_at, run_started_utc  -> UTC     -> SYSUTCDATETIME()
      run_started_at, collection_time                -> LOCAL   -> GETDATE()
+   who_is_active.collection_time is the one local column you are likely to hit
+   by accident. Read the sampler through vw_who_is_active, which adds
+   collection_time_utc, and everything is UTC again.
 
    Which table answers what:
      query_stat_delta + query_text  -> WHAT matters, WHAT IT COSTS, and the
@@ -15,7 +18,8 @@
                                        reduced. Use this instead of scanning
                                        xe_workload for values.
      job_run / vw_job_run_effective -> job durations and did_work
-     who_is_active                  -> long-running and blocking
+     who_is_active / vw_who_is_active -> long-running and blocking. Prefer
+                                       the view: it carries a UTC timestamp.
    ============================================================================ */
 
 /* ---------------------------------------------------------------------------
@@ -229,13 +233,13 @@ ORDER BY COUNT(*) DESC;
 /* ---------------------------------------------------------------------------
    9. Long-running and blocking.
    --------------------------------------------------------------------------- */
-SELECT collection_time, session_id, [database_name], login_name, [program_name],
+SELECT collection_time_utc, session_id, [database_name], login_name, [program_name],
        [dd hh:mm:ss.mss] AS elapsed, status, blocking_session_id, open_tran_count,
        LEFT(CONVERT(nvarchar(max), sql_text), 300) AS sql_snippet
-FROM dbo.who_is_active
-WHERE collection_time > DATEADD(day, -1, GETDATE())
+FROM dbo.vw_who_is_active
+WHERE collection_time_utc > DATEADD(day, -1, SYSUTCDATETIME())
   AND (blocking_session_id IS NOT NULL OR status <> 'sleeping')
-ORDER BY collection_time DESC;
+ORDER BY collection_time_utc DESC;
 
 
 /* ---------------------------------------------------------------------------

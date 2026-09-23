@@ -104,6 +104,27 @@ Correlacionar os dois sem normalizar retorna **zero correspondências e nenhum e
 
 O `job_run.run_started_utc` é normalizado no momento da coleta e é a coluna na qual a correlação faz join. SQL Server 2014 não tem `AT TIME ZONE`, então o offset é capturado com `DATEDIFF(minute, GETDATE(), GETUTCDATE())` quando a linha é gravada; fronteiras históricas de horário de verão ficam, por consequência, aproximadas dentro de uma hora.
 
+**O `sp_WhoIsActive` é o outro lado disso.** Ele grava `collection_time` em hora local do servidor, e todo o resto aqui está em UTC. Duas formas de isso morder, as duas observadas:
+
+- `MAX(collection_time)` comparado com `SYSUTCDATETIME()` faz um amostrador perfeitamente saudável parecer que parou horas atrás. Confira o `collection_run.rows_written` antes de concluir que um coletor morreu.
+- Um predicado de janela escrito contra `SYSUTCDATETIME()` sobre essa coluna desloca a janela silenciosamente pelo offset inteiro. Medido numa janela de 20 dias em UTC−7: 420 de 28.373 snapshots de um minuto, 1,5%, todos na borda. Vale corrigir, mas note o que **não** mudou — o pico e o p95 ficaram idênticos nas duas versões. Um defeito de base de tempo não é automaticamente uma resposta errada, e vale isolar a diferença antes que alguém refaça uma conclusão.
+
+Leia o amostrador pela `vw_who_is_active`, que expõe `collection_time_utc`, e o problema deixa de existir.
+
+## Nunca acrescente coluna à tabela de destino do sp_WhoIsActive
+
+O `sp_WhoIsActive` grava na `@destination_table` com um `INSERT` **sem lista de colunas**. Então a tabela precisa ter exatamente a forma que as flags `@get_*` produzem. Acrescente uma coluna — digamos, um gêmeo em UTC do `collection_time`, que é a coisa óbvia de se querer — e *toda coleta seguinte falha* com:
+
+```
+Msg 213: Column name or number of supplied values does not match table definition.
+```
+
+O coletor continua rodando, o erro cai no `collection_run`, e o amostrador para de registrar em silêncio. Custo de aprender isso na prática: oito minutos de buraco num amostrador de um minuto.
+
+Coluna calculada também não é a saída: a expressão precisa do offset vigente no momento da coleta, que é não determinístico, então não pode ser persistida nem indexada — e uma não persistida reavaliaria linhas históricas com o offset de hoje.
+
+Ponha o dado extra **ao lado** da tabela — uma linha por coleta, gravada pelo coletor enquanto ele ainda conhece o offset vivo — e junte numa view. Isso tem também uma propriedade que a coluna nunca teve: o offset guardado é o que estava de fato vigente, não um inferido depois, então uma fronteira de horário de verão dentro da janela de retenção continua correta.
+
 ## sysjobhistory tem duas armadilhas
 
 **O `run_duration` é um inteiro no formato HHMMSS, não segundos.** `123` significa 1 minuto e 23 segundos, não 123 segundos. Tratar como segundos subestima execuções curtas e superestima grosseiramente as longas.

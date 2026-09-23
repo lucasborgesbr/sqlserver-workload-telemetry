@@ -36,7 +36,7 @@ What generalises without qualification is the list of failure modes in [`docs/de
 | Raw workload | `xe_workload` | Every batch and RPC: complete statement text **including parameter values**, duration, CPU, logical and physical reads, I/O writes, row count, app, host, login, session, and the originating job step | 5 min | 30 days |
 | Aggregated query stats | `query_stat_delta` + `query_text` | Per-interval delta of executions, CPU, reads and writes by `query_hash` — the Query Store substitute | 5 min | 90 days |
 | Job executions | `job_run`, view `vw_job_run_effective` | Real duration in seconds, status, guard-step flag, and `did_work` | 2 min | 365 days |
-| Active request sampling | `who_is_active` | Long-running, blocked and blocking requests | 1 min | 30 days |
+| Active request sampling | `who_is_active`, view `vw_who_is_active` | Long-running, blocked and blocking requests. Read it through the view: `sp_WhoIsActive` stamps its timestamp in **server local** time, and the view adds the UTC equivalent | 1 min | 30 days |
 | Parameter values | `param_sample` | Real parameter values per query shape, pulled out of prepared-statement wrappers and reduced to compact rows — so nothing ever has to scan the workload table looking for values. Linked to its template by `body_hash`, a hash of the whole statement body | 1 h | 180 days |
 
 Plus `collection_run`, an audit trail of every collector execution. That one matters more than it looks: without it, a gap in the data is indistinguishable from a collector that quietly died.
@@ -55,7 +55,7 @@ Plus `collection_run`, an audit trail of every collector execution. That one mat
 
 The full footprint on the instance, so you know what you are agreeing to before running `deploy.sql`:
 
-- **One database** (`dba_telemetry` by default), `RECOVERY SIMPLE`, holding 10 tables and 1 view. Nothing is created in `master`, `msdb` or your application databases.
+- **One database** (`dba_telemetry` by default), `RECOVERY SIMPLE`, holding 12 tables and 3 views. Nothing is created in `master`, `msdb` or your application databases.
 - **One server-scoped event session**, `Workload_Capture`, created stopped.
 - **8 stored procedures and 1 inline function** (`fn_body_hash`, the single definition of the sample-to-template key), all in the telemetry database:
 
@@ -91,6 +91,7 @@ Applied by `usp_purge_telemetry`, which the daily job calls with no arguments so
 |---|---|---|---|
 | `xe_workload` | 30 days | `event_time_utc` | UTC |
 | `who_is_active` | 30 days | `collection_time` | **server local** |
+| `wia_collection` | follows `who_is_active` | — | the local-to-UTC map; a row lives as long as a sample references it |
 | `query_stat_delta` | 90 days | `collected_at` | UTC |
 | `job_run` | 365 days | `collected_at` | UTC |
 | `param_sample` | 180 days | `collected_at` | UTC |

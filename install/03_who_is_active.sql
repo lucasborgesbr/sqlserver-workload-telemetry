@@ -49,6 +49,32 @@ IF OBJECT_ID('dbo.who_is_active') IS NOT NULL
     CREATE NONCLUSTERED INDEX ix_wia_collection_time ON dbo.who_is_active (collection_time);
 GO
 
+/* ---------------------------------------------------------------------------
+   A UTC timestamp for who_is_active, WITHOUT touching that table.
+
+   sp_WhoIsActive stamps collection_time in SERVER LOCAL time, while every
+   other timestamp in this database is UTC. The mismatch is silent and it
+   misleads: comparing MAX(collection_time) against SYSUTCDATETIME() makes a
+   perfectly healthy collector look like it stopped hours ago, and a window
+   predicate written against SYSUTCDATETIME() skews by the whole UTC offset.
+
+   DO NOT FIX THIS BY ADDING A COLUMN TO who_is_active. sp_WhoIsActive writes
+   to that table with an INSERT that has no column list, so any extra column
+   makes every subsequent collection fail with error 213, "Column name or
+   number of supplied values does not match table definition". Verified the
+   hard way: doing it cost an 8-minute hole in the sampler.
+
+   So the mapping lives beside the table instead: one row per collection,
+   written by the collector while it still knows the live offset. Cardinality
+   is one row per minute, so this stays tiny.
+   --------------------------------------------------------------------------- */
+IF OBJECT_ID('dbo.wia_collection') IS NULL
+CREATE TABLE dbo.wia_collection (
+    collection_time     datetime     NOT NULL PRIMARY KEY,   -- server local, as stamped
+    collection_time_utc datetime2(3) NOT NULL
+);
+GO
+
 IF OBJECT_ID('dbo.usp_collect_who_is_active') IS NOT NULL
     DROP PROCEDURE dbo.usp_collect_who_is_active;
 GO
@@ -100,6 +126,15 @@ BEGIN
 
         SELECT @rows = COUNT(*) FROM dbo.who_is_active WHERE collection_time = @t;
 
+        /* Record what that local timestamp means in UTC. The offset is read
+           now rather than hardcoded, so it follows daylight saving without
+           anyone having to remember it — and, unlike a backfill, it is the
+           offset that was actually in force for this collection. */
+        INSERT INTO dbo.wia_collection (collection_time, collection_time_utc)
+        SELECT @t, DATEADD(minute, DATEDIFF(minute, GETDATE(), GETUTCDATE()), @t)
+         WHERE @t IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM dbo.wia_collection WHERE collection_time = @t);
+
         UPDATE dbo.collection_run SET ended_at = SYSUTCDATETIME(), rows_written = @rows, status = 'ok'
          WHERE run_id = @run_id;
     END TRY
@@ -109,6 +144,21 @@ BEGIN
         THROW;
     END CATCH
 END
+GO
+/* Read the sampler through this, not through the base table, and every
+   timestamp you touch is UTC like the rest of the database.
+
+   The base table's shape is fixed by the @get_* flags above, so SELECT * is
+   stable here — but it is resolved when the view is created, so if those flags
+   ever change, run sp_refreshview on this view as well. */
+IF OBJECT_ID('dbo.vw_who_is_active') IS NOT NULL
+    DROP VIEW dbo.vw_who_is_active;
+GO
+CREATE VIEW dbo.vw_who_is_active
+AS
+SELECT c.collection_time_utc, w.*
+FROM dbo.who_is_active w
+LEFT JOIN dbo.wia_collection c ON c.collection_time = w.collection_time;
 GO
 PRINT '03 - who_is_active logging ready.';
 GO

@@ -104,6 +104,27 @@ Correlating the two without normalising returns **zero matches and no error at a
 
 `job_run.run_started_utc` is normalised at collection time and is the column the correlation joins on. SQL Server 2014 has no `AT TIME ZONE`, so the offset is captured with `DATEDIFF(minute, GETDATE(), GETUTCDATE())` when the row is written; historical DST boundaries are consequently approximate to within an hour.
 
+**`sp_WhoIsActive` is the other side of this.** It stamps `collection_time` in server local time, and everything else here is UTC. Two ways that bites, both observed:
+
+- `MAX(collection_time)` compared against `SYSUTCDATETIME()` makes a perfectly healthy sampler look like it stopped hours ago. Cross-check `collection_run.rows_written` before concluding a collector died.
+- A window predicate written against `SYSUTCDATETIME()` over that column silently shifts the window by the whole offset. Measured on a 20-day window at UTC−7: 420 of 28,373 one-minute snapshots, 1.5%, all at the window edge. Worth fixing, but note what it did *not* move — the peak and the p95 were identical either way. A time-base bug is not automatically a wrong answer, and the difference is worth isolating before anyone reworks a conclusion.
+
+Read the sampler through `vw_who_is_active`, which exposes `collection_time_utc`, and the problem stops existing.
+
+## Never add a column to the sp_WhoIsActive destination table
+
+`sp_WhoIsActive` writes to `@destination_table` with an `INSERT` that has **no column list**. So the table must match the shape its `@get_*` flags produce, exactly. Add one column — say, a UTC twin of `collection_time`, which is the obvious thing to want — and *every subsequent collection fails* with:
+
+```
+Msg 213: Column name or number of supplied values does not match table definition.
+```
+
+The collector keeps running, the error lands in `collection_run`, and the sampler quietly stops recording. Cost of learning this directly: an eight-minute hole in a one-minute sampler.
+
+A computed column is not the escape hatch either: the expression needs the offset in force at collection time, which is non-deterministic, so it cannot be persisted or indexed, and a non-persisted one would re-evaluate historical rows at today's offset.
+
+Put the extra data **beside** the table instead — one row per collection, written by the collector while it still knows the live offset — and join it in a view. That also has a property the column never had: the offset stored is the one that was actually in force, rather than one inferred later, so a DST boundary inside the retention window stays correct.
+
 ## sysjobhistory has two traps
 
 **`run_duration` is an integer formatted HHMMSS, not seconds.** `123` means 1 minute 23 seconds, not 123 seconds. Treating it as seconds understates short runs and wildly overstates long ones.
