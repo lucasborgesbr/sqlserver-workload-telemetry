@@ -43,7 +43,7 @@ Plus `collection_run`, an audit trail of every collector execution. That one mat
 
 **Which table to use for what:**
 
-- `query_stat_delta` + `query_text` → *what matters, what it costs, and the query's shape.* Weight comes from `delta_executions`; shape from `query_text`, which holds the complete parameterized statement with its parameter declaration prefix, e.g. `(@P1 varchar(16))SELECT ...`. Filter `counter_reset = 0` when summing — see the design notes for why.
+- `query_stat_delta` + `query_text` → *what matters, what it costs, and the query's shape.* Weight comes from `delta_executions`; shape from `query_text`, which holds the complete parameterized statement with its parameter declaration prefix, e.g. `(@P1 varchar(16))SELECT ...`. Filter `counter_reset = 0` when summing — see the design notes for why. Or read `vw_query_stat_delta_clean`, which has that predicate built in.
 - `xe_workload` → *the full statement as executed, with real parameter values.* This is the only source of actual values, and the only place to see what a client sent rather than what the engine cached.
 - `param_sample` → *real parameter values, joinable to a weight.* Join it to `query_text` on `body_hash`, and from there to `query_stat_delta` on `query_hash`. **Filter `body_hash IS NOT NULL`** in anything that trusts the attribution: rows collected before that column existed were matched by text prefix, and on an ORM workload a prefix match is not merely incomplete — it binds values to the wrong statement. See the [migration](migrations/2026-09-22-match-by-body-hash.sql).
 
@@ -65,7 +65,7 @@ The full footprint on the instance, so you know what you are agreeing to before 
 | `usp_shred_xe_workload` | Reads the `.xel` set forward from a stored offset, shreds the XML, decodes the job GUID out of the Agent's `client_app_name`, and falls back to a full re-read if the offset went stale |
 | `usp_collect_job_runs` | Copies new `sysjobhistory` rows, converting the HHMMSS duration and normalising timestamps to UTC |
 | `usp_stamp_job_work` | Materializes `did_work` onto job rows while the source events still exist |
-| `usp_collect_who_is_active` | Runs `sp_WhoIsActive` into a table, then strips the sessions that are alive but not working |
+| `usp_collect_who_is_active` | Runs `sp_WhoIsActive` into a table, strips the sessions that are alive but not working, and records what that collection's local timestamp means in UTC |
 | `usp_refresh_job_inventory` | Rebuilds the map of which job steps touch a given database |
 | `usp_collect_param_samples` | Samples real parameter values out of prepared-statement wrappers, reducing millions of LOB-bearing rows to a few thousand compact ones |
 | `usp_purge_telemetry` | Batched retention deletes |
@@ -142,7 +142,20 @@ For the same reason, the Agent jobs created here carry **no replica guard**. A g
 
 ## Sizing
 
-Measured on a moderately busy instance: about **12 events/second**, roughly **750 bytes per stored row**, which came to about **28 GB** at steady state under the default retention. Your mileage will differ by an order of magnitude in either direction, so derive it yourself: run queries 1 and 10 after a week and divide.
+Measured over 27 days on a moderately busy instance: about **14 events/second** and **784 bytes per stored workload row**. Per-stream daily growth, and what each becomes at its default retention:
+
+| Stream | Per day | Retention | At steady state |
+|---|---:|---:|---:|
+| `xe_workload` | 921 MB | 30 d | **27.6 GB** |
+| `param_sample` | 56 MB | 180 d | **10.1 GB** |
+| `job_run` | 22 MB | 365 d | **8.2 GB** |
+| `who_is_active` | 129 MB | 30 d | 3.9 GB |
+| `query_stat_delta` | 31 MB | 90 d | 2.8 GB |
+| | | | **≈ 53 GB** |
+
+Two of those are counter-intuitive and worth reading before you size a volume. `job_run` and `param_sample` look like small tables — tens of megabytes a day — but their retention windows are 12x and 6x the workload window, so together they are a third of the total. If disk is tight, those two windows are the cheapest thing to shorten, because unlike `xe_workload` they are not what anyone is reading day to day.
+
+Your own rates will differ by an order of magnitude in either direction, so derive them rather than trusting the table: run queries 1 and 10 after a week and divide.
 
 The `.xel` file target is capped in configuration (default 512 MB × 20 files = 10 GB) and cannot grow past it. Long-term history lives in the tables, not the files.
 
@@ -177,9 +190,10 @@ config.example.sql      copy to config.sql and edit
 deploy.sql              runs every install script in order
 install/                01 schema · 02 collectors · 03 who_is_active
                         04 event session · 05 Agent jobs · 06 retention
+                        07 parameter sampler
 migrations/             upgrades for installations made before a fix
 uninstall/99_teardown   removes everything (guarded)
-queries/consumption.sql 10 queries for reading the data
+queries/consumption.sql 14 queries for reading the data
 docs/design-notes.md    the traps, and why the design is what it is
 ```
 

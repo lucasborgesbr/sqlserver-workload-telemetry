@@ -295,7 +295,7 @@ ORDER BY w.executions DESC;
 
 
 /* ---------------------------------------------------------------------------
-   11c. Audit the attribution instead of trusting it.
+   11b. Audit the attribution instead of trusting it.
 
    Every body should resolve to exactly one query_hash. Anything above 1 means
    two templates are colliding on the key, which on this design can only
@@ -317,7 +317,7 @@ ORDER BY hashes_per_body;
 
 
 /* ---------------------------------------------------------------------------
-   11b. Sampler health and coverage.
+   11c. Sampler health and coverage.
 
    parse_status other than ok/ok_no_params means the wrapper did not match the
    expected shape. A rising count there means the client changed how it sends

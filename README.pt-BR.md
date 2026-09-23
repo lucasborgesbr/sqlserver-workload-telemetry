@@ -43,9 +43,8 @@ Mais o `collection_run`, trilha de auditoria de cada execução dos coletores. E
 
 **Qual tabela usar para quê:**
 
-- `query_stat_delta` + `query_text` → *o que importa, quanto custa, e a forma da consulta.* O peso vem de `delta_executions`; a forma vem do `query_text`, que guarda o statement parametrizado completo com o prefixo de declaração de parâmetros, por exemplo `(@P1 varchar(16))SELECT ...`. Filtre `counter_reset = 0` ao somar — as notas de desenho explicam por quê.
+- `query_stat_delta` + `query_text` → *o que importa, quanto custa, e a forma da consulta.* O peso vem de `delta_executions`; a forma vem do `query_text`, que guarda o statement parametrizado completo com o prefixo de declaração de parâmetros, por exemplo `(@P1 varchar(16))SELECT ...`. Filtre `counter_reset = 0` ao somar — as notas de desenho explicam por quê. Ou leia a `vw_query_stat_delta_clean`, que já tem esse predicado embutido.
 - `xe_workload` → *o statement como foi executado, com os valores reais de parâmetro.* É a única fonte de valores de verdade, e o único lugar onde se vê o que o cliente enviou em vez do que o engine cacheou.
-
 - `param_sample` → *valores reais de parâmetro, uníveis a um peso.* Junte com `query_text` pelo `body_hash`, e de lá com `query_stat_delta` pelo `query_hash`. **Filtre `body_hash IS NOT NULL`** em qualquer coisa que confie na atribuição: linhas coletadas antes dessa coluna existir foram casadas por prefixo de texto, e numa carga gerada por ORM o casamento por prefixo não é apenas incompleto — ele liga valores ao statement errado. Veja a [migração](migrations/2026-09-22-match-by-body-hash.sql).
 
 O `xe_workload` em si não tem `query_hash`, então não pode ser unido aos pesos diretamente; isso é consequência deliberada da divisão de granularidade descrita abaixo, não descuido. O `param_sample` existe justamente para fazer essa ponte.
@@ -66,7 +65,7 @@ A pegada completa na instância, para você saber com o que está concordando an
 | `usp_shred_xe_workload` | Lê o conjunto `.xel` para frente a partir de um offset salvo, faz o shred do XML, decodifica o GUID do job do `client_app_name` do Agent, e relê do início se o offset ficou inválido |
 | `usp_collect_job_runs` | Copia novas linhas do `sysjobhistory`, convertendo a duração em HHMMSS e normalizando timestamps para UTC |
 | `usp_stamp_job_work` | Materializa o `did_work` nas linhas de job enquanto os eventos de origem ainda existem |
-| `usp_collect_who_is_active` | Roda o `sp_WhoIsActive` numa tabela e remove as sessões que estão vivas mas sem trabalho |
+| `usp_collect_who_is_active` | Roda o `sp_WhoIsActive` numa tabela, remove as sessões que estão vivas mas sem trabalho, e registra o que o timestamp local daquela coleta significa em UTC |
 | `usp_refresh_job_inventory` | Reconstrói o mapa de quais job steps tocam um determinado banco |
 | `usp_collect_param_samples` | Amostra valores reais de parâmetro dos wrappers de prepared statement, reduzindo milhões de linhas com LOB a alguns milhares compactas |
 | `usp_purge_telemetry` | Deletes de retenção em lote |
@@ -143,7 +142,20 @@ Pelo mesmo motivo, os jobs criados aqui **não têm guard de réplica**. Um guar
 
 ## Dimensionamento
 
-Medido numa instância de carga moderada: cerca de **12 eventos/segundo**, aproximadamente **750 bytes por linha armazenada**, o que deu por volta de **28 GB** em regime com a retenção padrão. Seu caso vai divergir em uma ordem de magnitude para cima ou para baixo, então calcule você mesmo: rode as queries 1 e 10 depois de uma semana e divida.
+Medido ao longo de 27 dias numa instância de carga moderada: cerca de **14 eventos/segundo** e **784 bytes por linha de workload**. Crescimento diário por fluxo, e no que cada um se transforma na sua retenção padrão:
+
+| Fluxo | Por dia | Retenção | Em regime |
+|---|---:|---:|---:|
+| `xe_workload` | 921 MB | 30 d | **27,6 GB** |
+| `param_sample` | 56 MB | 180 d | **10,1 GB** |
+| `job_run` | 22 MB | 365 d | **8,2 GB** |
+| `who_is_active` | 129 MB | 30 d | 3,9 GB |
+| `query_stat_delta` | 31 MB | 90 d | 2,8 GB |
+| | | | **≈ 53 GB** |
+
+Dois desses são contraintuitivos e vale ler antes de dimensionar um volume. O `job_run` e o `param_sample` parecem tabelas pequenas — dezenas de megabytes por dia — mas as janelas de retenção deles são 12x e 6x a janela do workload, então juntos são um terço do total. Se o disco estiver apertado, essas duas janelas são o mais barato de encurtar, porque ao contrário do `xe_workload` não são o que alguém lê no dia a dia.
+
+As suas taxas vão divergir em uma ordem de magnitude para cima ou para baixo, então calcule em vez de confiar na tabela: rode as queries 1 e 10 depois de uma semana e divida.
 
 O file target do `.xel` tem teto definido na configuração (padrão 512 MB × 20 arquivos = 10 GB) e não passa disso. O histórico de longo prazo vive nas tabelas, não nos arquivos.
 
@@ -178,9 +190,10 @@ config.example.sql      copie para config.sql e edite
 deploy.sql              roda todos os scripts de instalação em ordem
 install/                01 schema · 02 coletores · 03 who_is_active
                         04 event session · 05 jobs do Agent · 06 retenção
+                        07 amostrador de parâmetros
 migrations/             atualizações para instalações feitas antes de uma correção
 uninstall/99_teardown   remove tudo (com guarda de confirmação)
-queries/consumption.sql 10 queries para ler os dados
+queries/consumption.sql 14 queries para ler os dados
 docs/design-notes*.md   as armadilhas, e por que o desenho é o que é
 ```
 
